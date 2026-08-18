@@ -19,6 +19,8 @@ mod bytes;
 mod dict;
 mod groups;
 mod native;
+#[cfg(feature = "distinct_spill")]
+mod spillable_groups;
 
 pub use bytes::BytesDistinctCountAccumulator;
 pub use bytes::BytesViewDistinctCountAccumulator;
@@ -31,3 +33,5 @@ pub use native::BoolArray256DistinctCountAccumulatorI8;
 pub use native::BooleanDistinctCountAccumulator;
 pub use native::FloatDistinctCountAccumulator;
 pub use native::PrimitiveDistinctCountAccumulator;
+#[cfg(feature = "distinct_spill")]
+pub use spillable_groups::SpillablePrimitiveDistinctCountAccumulator;

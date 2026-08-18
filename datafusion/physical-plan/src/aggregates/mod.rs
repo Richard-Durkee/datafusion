@@ -208,6 +208,7 @@ use topk::heap::is_supported_heap_type;
 
 mod aggregate_hash_table;
 mod aggregate_stream;
+pub(crate) mod arrow_spiller;
 pub mod group_values;
 mod grouped_hash_stream;
 mod grouped_topk_stream;
@@ -219,6 +220,7 @@ mod ordered_single_stream;
 mod partial_reduce_stream;
 mod single_stream;
 mod skip_partial;
+pub(crate) mod spillable_accumulator;
 mod topk;
 
 /// Returns true if TopK aggregation data structures support the provided key and value types.
