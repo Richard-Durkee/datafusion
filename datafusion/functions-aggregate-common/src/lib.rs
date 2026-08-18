@@ -38,6 +38,8 @@ pub mod merge_arrays;
 pub mod min_max;
 pub mod noop_accumulator;
 pub mod order;
+#[cfg(feature = "distinct_spill")]
+pub mod spillable_hash_set;
 pub mod stats;
 pub mod tdigest;
 pub mod utils;

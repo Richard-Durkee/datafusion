@@ -40,6 +40,13 @@ workspace = true
 [lib]
 name = "datafusion_functions_aggregate_common"
 
+[features]
+default = []
+# Enables the grace-hash partitioned `SpillableHashSet` and the spillable
+# COUNT(DISTINCT) accumulator paths that build on it. Off by default so the
+# existing (unbounded, in-memory) behavior is unchanged unless opted in.
+distinct_spill = []
+
 [dependencies]
 arrow = { workspace = true }
 datafusion-common = { workspace = true }
