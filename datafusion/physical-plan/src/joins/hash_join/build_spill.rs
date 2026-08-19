@@ -583,3 +583,433 @@ mod tests {
         assert_eq!(p1.bit_offset(), 3);
     }
 }
+
+// =============================================================================
+// Spillable build-side collection
+// =============================================================================
+
+use datafusion_execution::runtime_env::RuntimeEnv;
+use futures::StreamExt;
+
+use crate::metrics::SpillMetrics;
+
+/// Result of `collect_left_input_spillable`: either all data fits in memory
+/// (same as non-spillable path) or some partitions were spilled.
+pub(super) enum SpillableBuildResult {
+    /// All data fit in memory. Equivalent to the non-spillable path.
+    InMemory {
+        batches: Vec<RecordBatch>,
+        num_rows: usize,
+    },
+    /// Some partitions were spilled. Contains the partitioner with hot/cold state.
+    Spilled(BuildPartitioner),
+}
+
+/// Collect build-side input with grace-hash spill fallback.
+///
+/// Replaces `try_fold` with a manual loop that detects memory pressure
+/// (via `try_grow`) and switches to partitioned mode mid-stream without
+/// losing already-accumulated data.
+///
+/// # Spill trigger
+///
+/// When `reservation.try_grow(batch_size)` fails, we:
+/// 1. Create a `BuildPartitioner`
+/// 2. Route all already-accumulated batches through it (partitioning them)
+/// 3. Spill the largest partition(s) until we're under budget
+/// 4. Continue streaming: new batches go through the partitioner with
+///    sticky routing (spilled partitions → disk, hot partitions → memory)
+///
+/// # Returns
+///
+/// `SpillableBuildResult::InMemory` if no spill was needed (same perf as before).
+/// `SpillableBuildResult::Spilled` if grace-hash partitioning was triggered.
+#[expect(clippy::too_many_arguments)]
+pub(super) async fn collect_left_input_spillable(
+    random_state: SeededRandomState,
+    mut left_stream: datafusion_execution::SendableRecordBatchStream,
+    on_left: Vec<PhysicalExprRef>,
+    metrics: crate::joins::utils::BuildProbeJoinMetrics,
+    reservation: datafusion_execution::memory_pool::MemoryReservation,
+    runtime_env: Arc<RuntimeEnv>,
+    spill_metrics: SpillMetrics,
+) -> Result<SpillableBuildResult> {
+    let schema = left_stream.schema();
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    let mut num_rows: usize = 0;
+    let mut memory_counter =
+        datafusion_common::utils::memory::RecordBatchMemoryCounter::new();
+
+    // Phase 1: try to accumulate everything in memory (fast path).
+    let mut partitioner: Option<BuildPartitioner> = None;
+
+    while let Some(batch_result) = left_stream.next().await {
+        let batch = batch_result?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+
+        let batch_size = memory_counter.count_batch(&batch);
+
+        if let Some(ref mut p) = partitioner {
+            // Already in spill mode: route through partitioner.
+            p.insert_batch(batch)?;
+        } else {
+            // Try to keep in memory.
+            let can_grow = reservation.try_grow(batch_size).is_ok();
+
+            if can_grow {
+                // Normal path: accumulate in memory.
+                num_rows += batch.num_rows();
+                batches.push(batch);
+            } else {
+                // OOM! Switch to partitioned mode.
+                metrics.build_mem_used.set(0);
+
+                // Create partitioner and route all existing batches through it.
+                let spill_manager = SpillManager::new(
+                    runtime_env.clone(),
+                    spill_metrics.clone(),
+                    Arc::clone(&schema),
+                );
+                let mut p = BuildPartitioner::new(
+                    Arc::clone(&schema),
+                    spill_manager,
+                    on_left.clone(),
+                    random_state.clone(),
+                );
+
+                // Route already-accumulated batches.
+                for existing_batch in batches.drain(..) {
+                    p.insert_batch(existing_batch)?;
+                }
+                // Route the batch that triggered the OOM.
+                p.insert_batch(batch)?;
+
+                // Free the reservation since partitioner now owns the data.
+                reservation.resize(0);
+
+                // Spill the largest partition(s) to get under memory pressure.
+                // Keep spilling until we've freed at least the batch_size that
+                // triggered OOM, or until nothing left to spill.
+                let mut freed = 0;
+                while freed < batch_size {
+                    let f = p.spill_largest_partition()?;
+                    if f == 0 {
+                        break;
+                    }
+                    freed += f;
+                }
+
+                partitioner = Some(p);
+            }
+        }
+    }
+
+    match partitioner {
+        Some(p) => Ok(SpillableBuildResult::Spilled(p)),
+        None => Ok(SpillableBuildResult::InMemory { batches, num_rows }),
+    }
+}
+
+// =============================================================================
+// Probe-side partitioner
+// =============================================================================
+
+/// Routes probe-side RecordBatches: rows matching spilled build partitions
+/// go to per-partition spill files; rows for hot partitions are returned
+/// for immediate joining.
+///
+/// The probe partitioner uses the SAME hash function and partition count as
+/// the build partitioner to ensure matching rows end up in the same partition.
+pub(super) struct ProbePartitioner {
+    /// Schema of the probe side.
+    schema: SchemaRef,
+    /// Spill manager for creating probe partition files.
+    spill_manager: SpillManager,
+    /// Which partitions were spilled on the build side.
+    /// Only rows matching these partitions are spilled on the probe side.
+    spilled_partitions: Vec<bool>,
+    /// Expressions to evaluate join keys on probe-side batches.
+    on_right: Vec<PhysicalExprRef>,
+    /// Same random state as build side (critical for correctness).
+    random_state: SeededRandomState,
+    /// Bit offset matching the build side's level.
+    bit_offset: usize,
+    /// Per-partition spill files for probe rows.
+    partition_files: Vec<Option<InProgressSpillFile>>,
+    /// Total rows spilled to disk.
+    spilled_rows: usize,
+}
+
+impl ProbePartitioner {
+    /// Create a probe partitioner that mirrors the build partitioner's state.
+    ///
+    /// `spilled_partitions[i]` should be `true` if build partition `i` was spilled.
+    pub fn new(
+        schema: SchemaRef,
+        spill_manager: SpillManager,
+        spilled_partitions: Vec<bool>,
+        on_right: Vec<PhysicalExprRef>,
+        random_state: SeededRandomState,
+        bit_offset: usize,
+    ) -> Self {
+        let num_partitions = spilled_partitions.len();
+        Self {
+            schema,
+            spill_manager,
+            spilled_partitions,
+            on_right,
+            random_state,
+            bit_offset,
+            partition_files: (0..num_partitions).map(|_| None).collect(),
+            spilled_rows: 0,
+        }
+    }
+
+    /// Partition a probe batch: rows for spilled build partitions go to disk,
+    /// rows for hot build partitions are returned for immediate joining.
+    ///
+    /// Returns the subset of rows that should be joined immediately (hot rows).
+    /// Returns None if ALL rows were spilled (no immediate join needed).
+    pub fn partition_batch(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<Option<RecordBatch>> {
+        if batch.num_rows() == 0 {
+            return Ok(Some(batch.clone()));
+        }
+
+        let num_rows = batch.num_rows();
+        let key_arrays = self
+            .on_right
+            .iter()
+            .map(|expr| {
+                expr.evaluate(batch)
+                    .and_then(|cv| cv.into_array(num_rows))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut hashes = vec![0u64; num_rows];
+        create_hashes(&key_arrays, self.random_state.random_state(), &mut hashes)?;
+
+        let partitions: Vec<usize> = hashes
+            .iter()
+            .map(|h| ((h >> self.bit_offset) as usize) % self.spilled_partitions.len())
+            .collect();
+
+        // Classify rows: hot (join immediately) vs cold (spill to disk).
+        let mut hot_indices: Vec<usize> = Vec::new();
+        let mut cold_by_partition: Vec<Vec<usize>> =
+            vec![Vec::new(); self.spilled_partitions.len()];
+
+        for (row_idx, &p) in partitions.iter().enumerate() {
+            if self.spilled_partitions[p] {
+                cold_by_partition[p].push(row_idx);
+            } else {
+                hot_indices.push(row_idx);
+            }
+        }
+
+        // Spill cold rows to their partition files.
+        for (p_idx, indices) in cold_by_partition.into_iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let indices_array = UInt64Array::from(
+                indices.iter().map(|&i| i as u64).collect::<Vec<_>>(),
+            );
+            let partition_batch = RecordBatch::try_new(
+                Arc::clone(&self.schema),
+                batch
+                    .columns()
+                    .iter()
+                    .map(|col| take(col, &indices_array, None).map_err(Into::into))
+                    .collect::<Result<Vec<_>>>()?,
+            )?;
+            self.spill_probe_batch(p_idx, &partition_batch)?;
+            self.spilled_rows += partition_batch.num_rows();
+        }
+
+        // Return hot rows for immediate joining.
+        if hot_indices.is_empty() {
+            return Ok(None);
+        }
+        if hot_indices.len() == num_rows {
+            return Ok(Some(batch.clone()));
+        }
+
+        let indices_array = UInt64Array::from(
+            hot_indices.iter().map(|&i| i as u64).collect::<Vec<_>>(),
+        );
+        let hot_batch = RecordBatch::try_new(
+            Arc::clone(&self.schema),
+            batch
+                .columns()
+                .iter()
+                .map(|col| take(col, &indices_array, None).map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+        Ok(Some(hot_batch))
+    }
+
+    /// Write a batch to a probe partition's spill file.
+    fn spill_probe_batch(
+        &mut self,
+        partition: usize,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let file = match &mut self.partition_files[partition] {
+            Some(f) => f,
+            None => {
+                let f = self.spill_manager.create_in_progress_file(
+                    &format!("HashJoinProbe_p{partition}"),
+                )?;
+                self.partition_files[partition] = Some(f);
+                self.partition_files[partition].as_mut().unwrap()
+            }
+        };
+        file.append_batch(batch)?;
+        Ok(())
+    }
+
+    /// Finish all probe spill files and return them.
+    ///
+    /// Returns a Vec where `result[i] = Some(file)` if partition i had probe
+    /// rows spilled, None otherwise.
+    pub fn finish(mut self) -> Result<Vec<Option<Arc<dyn SpillFile>>>> {
+        let mut files: Vec<Option<Arc<dyn SpillFile>>> =
+            Vec::with_capacity(self.partition_files.len());
+        for file_opt in &mut self.partition_files {
+            if let Some(mut file) = file_opt.take() {
+                files.push(file.finish()?);
+            } else {
+                files.push(None);
+            }
+        }
+        Ok(files)
+    }
+
+    /// Total probe rows spilled to disk.
+    pub fn spilled_rows(&self) -> usize {
+        self.spilled_rows
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_execution::runtime_env::RuntimeEnv;
+    use datafusion_physical_expr::expressions::col;
+    use crate::metrics::{ExecutionPlanMetricsSet, SpillMetrics};
+
+    fn probe_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, false),
+        ]))
+    }
+
+    fn probe_batch(keys: Vec<i32>, vals: Vec<&str>) -> RecordBatch {
+        RecordBatch::try_new(
+            probe_schema(),
+            vec![
+                Arc::new(Int32Array::from(keys)),
+                Arc::new(StringArray::from(vals)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn probe_spill_manager(schema: SchemaRef) -> SpillManager {
+        let runtime = Arc::new(RuntimeEnv::default());
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let spill_metrics = SpillMetrics::new(&metrics_set, 0);
+        SpillManager::new(runtime, spill_metrics, schema)
+    }
+
+    #[test]
+    fn probe_all_hot_returns_full_batch() {
+        let schema = probe_schema();
+        let spill_mgr = probe_spill_manager(Arc::clone(&schema));
+        let on_right = vec![col("key", &schema).unwrap()];
+        let random_state = SeededRandomState::with_seed(12345);
+        // No partitions spilled
+        let spilled = vec![false; NUM_PARTITIONS];
+
+        let mut probe = ProbePartitioner::new(
+            schema,
+            spill_mgr,
+            spilled,
+            on_right,
+            random_state,
+            0,
+        );
+
+        let batch = probe_batch(vec![1, 2, 3, 4, 5], vec!["a", "b", "c", "d", "e"]);
+        let result = probe.partition_batch(&batch).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().num_rows(), 5);
+        assert_eq!(probe.spilled_rows(), 0);
+    }
+
+    #[test]
+    fn probe_all_cold_returns_none() {
+        let schema = probe_schema();
+        let spill_mgr = probe_spill_manager(Arc::clone(&schema));
+        let on_right = vec![col("key", &schema).unwrap()];
+        let random_state = SeededRandomState::with_seed(12345);
+        // ALL partitions spilled
+        let spilled = vec![true; NUM_PARTITIONS];
+
+        let mut probe = ProbePartitioner::new(
+            schema,
+            spill_mgr,
+            spilled,
+            on_right,
+            random_state,
+            0,
+        );
+
+        let batch = probe_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+        let result = probe.partition_batch(&batch).unwrap();
+        assert!(result.is_none());
+        assert_eq!(probe.spilled_rows(), 3);
+    }
+
+    #[test]
+    fn probe_mixed_splits_correctly() {
+        let schema = probe_schema();
+        let spill_mgr = probe_spill_manager(Arc::clone(&schema));
+        let on_right = vec![col("key", &schema).unwrap()];
+        let random_state = SeededRandomState::with_seed(12345);
+        // Spill only partition 0
+        let mut spilled = vec![false; NUM_PARTITIONS];
+        spilled[0] = true;
+
+        let mut probe = ProbePartitioner::new(
+            schema,
+            spill_mgr,
+            spilled,
+            on_right,
+            random_state,
+            0,
+        );
+
+        // Insert enough rows that some land in partition 0 and some don't
+        let batch = probe_batch(
+            (0..100).collect(),
+            (0..100).map(|_| "x").collect(),
+        );
+        let result = probe.partition_batch(&batch).unwrap();
+        // Some rows should be hot (not all 100, not 0)
+        assert!(result.is_some());
+        let hot = result.unwrap();
+        assert!(hot.num_rows() > 0);
+        assert!(hot.num_rows() < 100);
+        // Spilled + hot should equal 100
+        assert_eq!(probe.spilled_rows() + hot.num_rows(), 100);
+    }
+}
