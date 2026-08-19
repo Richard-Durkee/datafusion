@@ -25,3 +25,4 @@ mod inlist_builder;
 mod partitioned_hash_eval;
 mod shared_bounds;
 mod stream;
+mod build_spill;
