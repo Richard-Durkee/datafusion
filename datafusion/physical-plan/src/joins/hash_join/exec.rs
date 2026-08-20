@@ -2430,6 +2430,241 @@ async fn collect_left_input(
     Ok(data)
 }
 
+/// Spillable variant of [`collect_left_input`] that falls back to grace-hash
+/// partitioning when the build side exceeds available memory.
+///
+/// On success without spill, returns `(JoinLeftData, None)` — identical to the
+/// non-spillable path.
+///
+/// On spill, returns `(JoinLeftData_from_hot_partitions, Some(spill_metadata))`.
+/// The `JoinLeftData` contains only the hot (in-memory) partitions' hash table.
+/// The spill metadata contains cold partition files that must be restored in a
+/// subsequent per-partition join pass.
+///
+/// Caller must pass `runtime_env` and `spill_metrics` for SpillManager creation.
+#[expect(clippy::too_many_arguments)]
+async fn collect_left_input_with_spill(
+    random_state: RandomState,
+    seeded_random_state: SeededRandomState,
+    left_stream: SendableRecordBatchStream,
+    on_left: Vec<PhysicalExprRef>,
+    metrics: BuildProbeJoinMetrics,
+    reservation: MemoryReservation,
+    with_visited_indices_bitmap: bool,
+    probe_threads_count: usize,
+    config: Arc<ConfigOptions>,
+    null_equality: NullEquality,
+    runtime_env: Arc<datafusion_execution::runtime_env::RuntimeEnv>,
+    spill_metrics: crate::metrics::SpillMetrics,
+) -> Result<(JoinLeftData, Option<super::build_spill::SpilledPartitionMeta>)> {
+    use super::build_spill::{
+        SpillableBuildResult, collect_left_input_spillable,
+    };
+
+    let schema = left_stream.schema();
+    let result = collect_left_input_spillable(
+        seeded_random_state.clone(),
+        left_stream,
+        on_left.clone(),
+        metrics.clone(),
+        reservation.new_empty(),
+        runtime_env,
+        spill_metrics,
+    )
+    .await?;
+
+    match result {
+        SpillableBuildResult::InMemory { batches, num_rows } => {
+            // Normal path: build hash table from all batches (same as collect_left_input Phase 2)
+            let join_left_data = build_hash_table_from_batches(
+                batches,
+                num_rows,
+                &schema,
+                &on_left,
+                &random_state,
+                &mut reservation.new_empty(),
+                &metrics,
+                with_visited_indices_bitmap,
+                probe_threads_count,
+                &config,
+                null_equality,
+                None,
+            )?;
+            Ok((join_left_data, None))
+        }
+        SpillableBuildResult::Spilled(partitioner) => {
+            // Spill path: build hash table from hot partitions only
+            let spilled_partitions: Vec<bool> = (0..super::build_spill::NUM_PARTITIONS)
+                .map(|i| partitioner.partitions[i].is_spilled)
+                .collect();
+            let bit_offset = partitioner.bit_offset();
+
+            let (hot_batches, cold_files) = partitioner.finish()?;
+
+            // Merge all hot batches into a single batch list
+            let mut all_hot_batches: Vec<RecordBatch> = Vec::new();
+            let mut hot_rows = 0;
+            for partition_batches in hot_batches {
+                for batch in partition_batches {
+                    hot_rows += batch.num_rows();
+                    all_hot_batches.push(batch);
+                }
+            }
+
+            let join_left_data = build_hash_table_from_batches(
+                all_hot_batches,
+                hot_rows,
+                &schema,
+                &on_left,
+                &random_state,
+                &mut reservation.new_empty(),
+                &metrics,
+                with_visited_indices_bitmap,
+                probe_threads_count,
+                &config,
+                null_equality,
+                None,
+            )?;
+
+            let meta = super::build_spill::SpilledPartitionMeta {
+                cold_files,
+                spilled_partitions,
+                bit_offset,
+                schema: Arc::clone(&schema),
+                on_left,
+                random_state: seeded_random_state,
+            };
+
+            Ok((join_left_data, Some(meta)))
+        }
+    }
+}
+
+/// Build a JoinLeftData (hash table + metadata) from pre-collected batches.
+///
+/// This is the "Phase 2" of collect_left_input extracted for reuse by both
+/// the normal path and the spill-restore path.
+#[expect(clippy::too_many_arguments)]
+fn build_hash_table_from_batches(
+    batches: Vec<RecordBatch>,
+    num_rows: usize,
+    schema: &SchemaRef,
+    on_left: &[PhysicalExprRef],
+    random_state: &RandomState,
+    reservation: &mut MemoryReservation,
+    metrics: &BuildProbeJoinMetrics,
+    with_visited_indices_bitmap: bool,
+    probe_threads_count: usize,
+    config: &ConfigOptions,
+    null_equality: NullEquality,
+    bounds: Option<PartitionBounds>,
+) -> Result<JoinLeftData> {
+    let (join_hash_map, batch, left_values) =
+        if let Some((array_map, batch, left_value)) = try_create_array_map(
+            &bounds,
+            schema,
+            &batches,
+            on_left,
+            reservation,
+            config.execution.perfect_hash_join_small_build_threshold,
+            config.execution.perfect_hash_join_min_key_density,
+            null_equality,
+        )? {
+            metrics.build_mem_used.add(array_map.size());
+            (Map::ArrayMap(array_map), batch, left_value)
+        } else {
+            let fixed_size_u32 = size_of::<JoinHashMapU32>();
+            let fixed_size_u64 = size_of::<JoinHashMapU64>();
+
+            let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
+                let estimated_hashtable_size =
+                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+                reservation.try_grow(estimated_hashtable_size)?;
+                metrics.build_mem_used.add(estimated_hashtable_size);
+                Box::new(JoinHashMapU64::with_capacity(num_rows))
+            } else {
+                let estimated_hashtable_size =
+                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+                reservation.try_grow(estimated_hashtable_size)?;
+                metrics.build_mem_used.add(estimated_hashtable_size);
+                Box::new(JoinHashMapU32::with_capacity(num_rows))
+            };
+
+            let mut hashes_buffer = Vec::new();
+            let mut offset = 0;
+            let batches_iter = batches.iter().rev();
+
+            for batch in batches_iter.clone() {
+                hashes_buffer.clear();
+                hashes_buffer.resize(batch.num_rows(), 0);
+                update_hash(
+                    on_left,
+                    batch,
+                    &mut *hashmap,
+                    offset,
+                    random_state,
+                    &mut hashes_buffer,
+                    0,
+                    true,
+                    null_equality,
+                )?;
+                offset += batch.num_rows();
+            }
+
+            let batch = concat_batches(schema, batches_iter.clone())?;
+            let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+
+            (Map::HashMap(hashmap), batch, left_values)
+        };
+
+    let visited_indices_bitmap = if with_visited_indices_bitmap {
+        let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
+        reservation.try_grow(bitmap_size)?;
+        metrics.build_mem_used.add(bitmap_size);
+        let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
+        bitmap_buffer.append_n(num_rows, false);
+        bitmap_buffer
+    } else {
+        BooleanBufferBuilder::new(0)
+    };
+
+    let map = Arc::new(join_hash_map);
+
+    let membership = if num_rows == 0 {
+        PushdownStrategy::Empty
+    } else {
+        let estimated_size = left_values
+            .iter()
+            .map(|arr| arr.get_array_memory_size())
+            .sum::<usize>();
+        if left_values.is_empty()
+            || left_values[0].is_empty()
+            || estimated_size > config.optimizer.hash_join_inlist_pushdown_max_size
+            || map.num_of_distinct_key()
+                > config.optimizer.hash_join_inlist_pushdown_max_distinct_values
+        {
+            PushdownStrategy::Map(Arc::clone(&map))
+        } else if let Some(in_list_values) = build_struct_inlist_values(&left_values)? {
+            PushdownStrategy::InList(in_list_values)
+        } else {
+            PushdownStrategy::Map(Arc::clone(&map))
+        }
+    };
+
+    Ok(JoinLeftData {
+        map,
+        batch,
+        values: left_values,
+        visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
+        probe_threads_counter: AtomicUsize::new(probe_threads_count),
+        _reservation: reservation.new_empty(),
+        bounds,
+        membership,
+        probe_side_non_empty: AtomicBool::new(false),
+        probe_side_has_null: AtomicBool::new(false),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -50,6 +50,24 @@ use datafusion_execution::spill_file::SpillFile;
 
 use super::partitioned_hash_eval::SeededRandomState;
 
+/// Metadata about spilled partitions, passed from the build phase to the
+/// probe/restore phase so the stream knows which partitions need replay.
+pub(super) struct SpilledPartitionMeta {
+    /// Finished spill files for cold build-side partitions.
+    /// `cold_files[i] = Some(file)` if partition i was spilled, None otherwise.
+    pub cold_files: Vec<Option<Arc<dyn SpillFile>>>,
+    /// Which partitions were spilled (mirrors cold_files but as booleans).
+    pub spilled_partitions: Vec<bool>,
+    /// Bit offset used for partitioning (for recursive repartition at restore).
+    pub bit_offset: usize,
+    /// Build-side schema (needed to rebuild hash tables from spilled data).
+    pub schema: SchemaRef,
+    /// Join key expressions for the build side.
+    pub on_left: Vec<PhysicalExprRef>,
+    /// Random state used for partitioning (probe side must match).
+    pub random_state: SeededRandomState,
+}
+
 /// Number of grace-hash partitions for the build side.
 ///
 /// 8 partitions (3 bits) matches Velox's default. With 1 GB memory limit,
@@ -58,11 +76,11 @@ use super::partitioned_hash_eval::SeededRandomState;
 pub const NUM_PARTITIONS: usize = 8;
 
 /// Tracks per-partition state: rows buffered, bytes spilled, file handle.
-struct PartitionState {
+pub(super) struct PartitionState {
     /// Spill file for this partition (created lazily on first spill).
     file: Option<InProgressSpillFile>,
     /// Whether this partition has been designated for spilling.
-    is_spilled: bool,
+    pub(super) is_spilled: bool,
     /// Running byte count of data written to disk for this partition.
     spilled_bytes: usize,
     /// Running row count of data in memory for this partition (before spill).
@@ -99,7 +117,7 @@ pub(super) struct BuildPartitioner {
     /// Spill manager for creating partition files.
     spill_manager: SpillManager,
     /// Per-partition state.
-    partitions: Vec<PartitionState>,
+    pub(super) partitions: Vec<PartitionState>,
     /// Expressions to evaluate join keys on build-side batches.
     on_left: Vec<PhysicalExprRef>,
     /// Random state for hashing (must match probe-side partitioning).
