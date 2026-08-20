@@ -1493,83 +1493,20 @@ impl ExecutionPlan for HashJoinExec {
                 let reservation =
                     MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
 
-                // Capture state needed for spill fallback
-                let spill_enabled = context.runtime_env().disk_manager.tmp_files_enabled();
-                let left_plan = Arc::clone(&self.left);
-                let ctx = Arc::clone(&context);
-                let seeded_rs = self.random_state.clone();
-                let rs = self.random_state.random_state().clone();
-                let ol = on_left.clone();
-                let jm = join_metrics.clone();
-                let wb = need_produce_result_in_final(self.join_type);
-                let pc = self.right().output_partitioning().partition_count();
-                let edp = enable_dynamic_filter_pushdown;
-                let cfg = Arc::clone(context.session_config().options());
-                let ne = self.null_equality;
-                let amc = array_map_created_count;
-                let spill_metrics_set = self.metrics.clone();
-
-                Ok(async move {
-                    // Try the optimized path first (ArrayMap, bounds, dynamic filters)
-                    let result = collect_left_input(
-                        rs.clone(),
-                        left_stream,
-                        ol.clone(),
-                        jm.clone(),
-                        reservation,
-                        wb,
-                        pc,
-                        edp,
-                        Arc::clone(&cfg),
-                        ne,
-                        amc,
-                    )
-                    .await;
-
-                    match result {
-                        Ok(data) => Ok(data),
-                        Err(e) if spill_enabled && matches!(
-                            e.find_root(),
-                            datafusion_common::DataFusionError::ResourcesExhausted(_)
-                        ) => {
-                            // OOM: re-execute left child through spillable path
-                            log::info!(
-                                "HashJoin build-side OOM, falling back to \
-                                 grace-hash spill"
-                            );
-                            let left_stream2 = left_plan.execute(0, Arc::clone(&ctx))?;
-                            let reservation2 = MemoryConsumer::new("HashJoinInput[spill]")
-                                .with_can_spill(true)
-                                .register(ctx.memory_pool());
-                            let spill_metrics = crate::metrics::SpillMetrics::new(
-                                &spill_metrics_set, 0,
-                            );
-                            let runtime_env = ctx.runtime_env();
-
-                            let (join_left_data, _spill_meta) =
-                                collect_left_input_with_spill(
-                                    rs,
-                                    seeded_rs,
-                                    left_stream2,
-                                    ol,
-                                    jm,
-                                    reservation2,
-                                    wb,
-                                    pc,
-                                    cfg,
-                                    ne,
-                                    runtime_env,
-                                    spill_metrics,
-                                )
-                                .await?;
-
-                            // TODO: store _spill_meta for probe-side routing
-                            // and per-partition restore loop (follow-up PR)
-                            Ok(join_left_data)
-                        }
-                        Err(e) => Err(e),
-                    }
-                })
+                Ok(collect_left_input(
+                    self.random_state.random_state().clone(),
+                    left_stream,
+                    on_left.clone(),
+                    join_metrics.clone(),
+                    reservation,
+                    need_produce_result_in_final(self.join_type),
+                    self.right().output_partitioning().partition_count(),
+                    enable_dynamic_filter_pushdown,
+                    Arc::clone(context.session_config().options()),
+                    self.null_equality,
+                    array_map_created_count,
+                    context.runtime_env(),
+                ))
             })?,
             PartitionMode::Partitioned => {
                 let left_stream = self.left.execute(partition, Arc::clone(&context))?;
@@ -1589,6 +1526,7 @@ impl ExecutionPlan for HashJoinExec {
                     Arc::clone(context.session_config().options()),
                     self.null_equality,
                     array_map_created_count,
+                    context.runtime_env(),
                 ))
             }
             PartitionMode::Auto => {
@@ -2303,6 +2241,7 @@ async fn collect_left_input(
     config: Arc<ConfigOptions>,
     null_equality: NullEquality,
     array_map_created_count: Count,
+    runtime_env: Arc<datafusion_execution::runtime_env::RuntimeEnv>,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
 
@@ -2317,30 +2256,133 @@ async fn collect_left_input(
         should_compute_dynamic_filters || should_collect_min_max_for_phj,
     )?;
 
-    let state = left_stream
-        .try_fold(initial, |mut state, batch| async move {
-            // Update accumulators if computing bounds
-            if let Some(ref mut accumulators) = state.bounds_accumulators {
-                for accumulator in accumulators {
-                    accumulator.update_batch(&batch)?;
+    // Manual stream loop (replaces try_fold) to support mid-stream spill.
+    // When try_grow fails and disk is available, switches to grace-hash
+    // partitioned mode without re-executing the left child.
+    let mut state = initial;
+    let mut left_stream = left_stream;
+    let mut partitioner: Option<super::build_spill::BuildPartitioner> = None;
+
+    use futures::StreamExt;
+    while let Some(batch_result) = left_stream.next().await {
+        let batch = batch_result?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+
+        // Update accumulators if computing bounds (always, regardless of spill)
+        if let Some(ref mut accumulators) = state.bounds_accumulators {
+            for accumulator in accumulators {
+                accumulator.update_batch(&batch)?;
+            }
+        }
+
+        if let Some(ref mut p) = partitioner {
+            // Already in spill mode: route through partitioner
+            p.insert_batch(batch)?;
+            state.metrics.build_input_batches.add(1);
+        } else {
+            let batch_size = state.memory_counter.count_batch(&batch);
+            let can_grow = state.reservation.try_grow(batch_size).is_ok();
+
+            if can_grow {
+                // Normal accumulation
+                state.metrics.build_mem_used.add(batch_size);
+                state.metrics.build_input_batches.add(1);
+                state.metrics.build_input_rows.add(batch.num_rows());
+                state.num_rows += batch.num_rows();
+                state.batches.push(batch);
+            } else {
+                // OOM! Switch to partitioned mode if disk is available.
+                if !runtime_env.disk_manager.tmp_files_enabled() {
+                    // No disk manager — propagate OOM error as before
+                    state.reservation.try_grow(batch_size)?;
+                    unreachable!("try_grow should have failed");
+                }
+                // Create BuildPartitioner and route all existing + new data through it.
+                let spill_mgr = crate::spill::spill_manager::SpillManager::new(
+                    Arc::clone(&runtime_env),
+                    crate::metrics::SpillMetrics::new(
+                        &ExecutionPlanMetricsSet::new(), 0,
+                    ),
+                    Arc::clone(&schema),
+                );
+                let mut p = super::build_spill::BuildPartitioner::new(
+                    Arc::clone(&schema),
+                    spill_mgr,
+                    on_left.clone(),
+                    SeededRandomState::with_seed(
+                        // Use same seed as the join's random state for consistency
+                        12210250226015887276,
+                    ),
+                );
+
+                // Route existing batches through partitioner
+                for existing_batch in state.batches.drain(..) {
+                    p.insert_batch(existing_batch)?;
+                }
+                // Route the batch that triggered OOM
+                p.insert_batch(batch)?;
+
+                // Free reservation — partitioner now owns the data
+                state.reservation.resize(0);
+                state.metrics.build_mem_used.set(0);
+
+                // Spill the largest partition(s) to relieve pressure
+                let mut freed = 0;
+                while freed < batch_size {
+                    let f = p.spill_largest_partition()?;
+                    if f == 0 { break; }
+                    freed += f;
+                }
+
+                state.metrics.build_input_batches.add(1);
+                partitioner = Some(p);
+            }
+        }
+    }
+
+    // If spill was triggered, restore cold partitions and merge with hot
+    if let Some(p) = partitioner {
+        let (hot_batches, cold_files) = p.finish()?;
+
+        // Collect all batches: hot + cold (read from disk)
+        let mut all_batches: Vec<RecordBatch> = Vec::new();
+        let mut total_rows = 0;
+
+        for partition_batches in hot_batches {
+            for batch in partition_batches {
+                total_rows += batch.num_rows();
+                all_batches.push(batch);
+            }
+        }
+
+        // Read cold partitions from spill files
+        for file_opt in cold_files.iter() {
+            if let Some(file) = file_opt {
+                let spill_mgr = crate::spill::spill_manager::SpillManager::new(
+                    Arc::clone(&runtime_env),
+                    crate::metrics::SpillMetrics::new(
+                        &ExecutionPlanMetricsSet::new(), 0,
+                    ),
+                    Arc::clone(&schema),
+                );
+                let mut stream = spill_mgr.read_spill_as_stream(
+                    Arc::clone(file), None,
+                )?;
+                while let Some(batch_result) = stream.next().await {
+                    let batch = batch_result?;
+                    if batch.num_rows() > 0 {
+                        total_rows += batch.num_rows();
+                        all_batches.push(batch);
+                    }
                 }
             }
+        }
 
-            // Decide if we spill or not
-            let batch_size = state.memory_counter.count_batch(&batch);
-            // Reserve memory for incoming batch
-            state.reservation.try_grow(batch_size)?;
-            // Update metrics
-            state.metrics.build_mem_used.add(batch_size);
-            state.metrics.build_input_batches.add(1);
-            state.metrics.build_input_rows.add(batch.num_rows());
-            // Update row count
-            state.num_rows += batch.num_rows();
-            // Push batch to output
-            state.batches.push(batch);
-            Ok(state)
-        })
-        .await?;
+        state.batches = all_batches;
+        state.num_rows = total_rows;
+    }
 
     // Extract fields from state
     let BuildSideState {
@@ -2532,7 +2574,7 @@ async fn collect_left_input_with_spill(
         on_left.clone(),
         metrics.clone(),
         reservation.new_empty(),
-        runtime_env,
+        Arc::clone(&runtime_env),
         spill_metrics.clone(),
     )
     .await?;
@@ -2588,7 +2630,7 @@ async fn collect_left_input_with_spill(
             for (p_idx, file_opt) in cold_files.iter().enumerate() {
                 if let Some(file) = file_opt {
                     let spill_mgr = crate::spill::spill_manager::SpillManager::new(
-                        Arc::new(datafusion_execution::runtime_env::RuntimeEnv::default()),
+                        Arc::clone(&runtime_env),
                         spill_metrics.clone(),
                         Arc::clone(&schema),
                     );
@@ -6406,6 +6448,10 @@ mod tests {
         for join_type in join_types {
             let runtime = RuntimeEnvBuilder::new()
                 .with_memory_limit(100, 1.0)
+                .with_disk_manager_builder(
+                    datafusion_execution::disk_manager::DiskManagerBuilder::default()
+                        .with_mode(datafusion_execution::disk_manager::DiskManagerMode::Disabled),
+                )
                 .build_arc()?;
             let session_config = SessionConfig::default().with_batch_size(50);
             let task_ctx = TaskContext::default()
