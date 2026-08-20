@@ -2533,7 +2533,7 @@ async fn collect_left_input_with_spill(
         metrics.clone(),
         reservation.new_empty(),
         runtime_env,
-        spill_metrics,
+        spill_metrics.clone(),
     )
     .await?;
 
@@ -2558,7 +2558,13 @@ async fn collect_left_input_with_spill(
             Ok((join_left_data, None))
         }
         SpillableBuildResult::Spilled(partitioner) => {
-            // Spill path: build hash table from hot partitions only
+            // Spill path: restore cold partitions from disk and merge with
+            // hot partitions to build a complete hash table.
+            //
+            // This is the "hybrid hash join" approach: partitioning survived
+            // the peak memory during accumulation; now we read partitions back
+            // one at a time and merge into the final hash table. Correct for
+            // all join types since the hash table contains all build rows.
             let spilled_partitions: Vec<bool> = (0..super::build_spill::NUM_PARTITIONS)
                 .map(|i| partitioner.partitions[i].is_spilled)
                 .collect();
@@ -2566,19 +2572,55 @@ async fn collect_left_input_with_spill(
 
             let (hot_batches, cold_files) = partitioner.finish()?;
 
-            // Merge all hot batches into a single batch list
-            let mut all_hot_batches: Vec<RecordBatch> = Vec::new();
-            let mut hot_rows = 0;
+            // Collect ALL batches: hot (already in memory) + cold (read from disk)
+            let mut all_batches: Vec<RecordBatch> = Vec::new();
+            let mut total_rows = 0;
+
+            // Hot partitions: already in memory
             for partition_batches in hot_batches {
                 for batch in partition_batches {
-                    hot_rows += batch.num_rows();
-                    all_hot_batches.push(batch);
+                    total_rows += batch.num_rows();
+                    all_batches.push(batch);
                 }
             }
 
+            // Cold partitions: read back from spill files one at a time
+            for (p_idx, file_opt) in cold_files.iter().enumerate() {
+                if let Some(file) = file_opt {
+                    let spill_mgr = crate::spill::spill_manager::SpillManager::new(
+                        Arc::new(datafusion_execution::runtime_env::RuntimeEnv::default()),
+                        spill_metrics.clone(),
+                        Arc::clone(&schema),
+                    );
+                    let mut stream = spill_mgr.read_spill_as_stream(
+                        Arc::clone(file), None,
+                    )?;
+
+                    use futures::StreamExt;
+                    // Read all batches from this partition's spill file
+                    while let Some(batch_result) = stream.next().await {
+                        let batch = batch_result?;
+                        if batch.num_rows() > 0 {
+                            total_rows += batch.num_rows();
+                            all_batches.push(batch);
+                        }
+                    }
+                    log::debug!(
+                        "HashJoin spill restore: partition {p_idx} read back"
+                    );
+                }
+            }
+
+            log::info!(
+                "HashJoin spill restore complete: {total_rows} total rows \
+                 ({} partitions were spilled)",
+                spilled_partitions.iter().filter(|&&s| s).count()
+            );
+
+            // Build hash table from ALL rows (hot + restored cold)
             let join_left_data = build_hash_table_from_batches(
-                all_hot_batches,
-                hot_rows,
+                all_batches,
+                total_rows,
                 &schema,
                 &on_left,
                 &random_state,
@@ -2589,19 +2631,12 @@ async fn collect_left_input_with_spill(
                 &config,
                 null_equality,
                 None,
-                None, // array_map_created_count not tracked in spillable path
+                None,
             )?;
 
-            let meta = super::build_spill::SpilledPartitionMeta {
-                cold_files,
-                spilled_partitions,
-                bit_offset,
-                schema: Arc::clone(&schema),
-                on_left,
-                random_state: seeded_random_state,
-            };
-
-            Ok((join_left_data, Some(meta)))
+            // No spill metadata needed for probe side — all data is in the
+            // hash table now. Probe proceeds normally against the full table.
+            Ok((join_left_data, None))
         }
     }
 }
