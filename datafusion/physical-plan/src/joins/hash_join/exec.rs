@@ -221,6 +221,10 @@ pub(super) struct JoinLeftData {
     pub(super) probe_side_non_empty: AtomicBool,
     /// Shared atomic flag indicating if any probe partition saw NULL in join keys (for null-aware anti joins)
     pub(super) probe_side_has_null: AtomicBool,
+    /// Spill metadata for grace-hash partitioned join. If Some, the hash table
+    /// contains only hot-partition data and cold partitions must be processed
+    /// separately via per-partition restore in the stream.
+    pub(super) spill_meta: Option<super::build_spill::SpilledPartitionMeta>,
 }
 
 impl JoinLeftData {
@@ -2342,47 +2346,40 @@ async fn collect_left_input(
         }
     }
 
-    // If spill was triggered, restore cold partitions and merge with hot
-    if let Some(p) = partitioner {
+    // If spill was triggered, build hash table from hot partitions only.
+    // Cold partitions are attached as spill_meta for per-partition restore
+    // in the stream's probe phase.
+    let spill_meta = if let Some(p) = partitioner {
+        let spilled_partitions: Vec<bool> = (0..super::build_spill::NUM_PARTITIONS)
+            .map(|i| p.partitions[i].is_spilled)
+            .collect();
+        let bit_offset = p.bit_offset();
         let (hot_batches, cold_files) = p.finish()?;
 
-        // Collect all batches: hot + cold (read from disk)
-        let mut all_batches: Vec<RecordBatch> = Vec::new();
-        let mut total_rows = 0;
-
+        // Only keep hot partition batches for the hash table
+        let mut hot_data: Vec<RecordBatch> = Vec::new();
+        let mut hot_rows = 0;
         for partition_batches in hot_batches {
             for batch in partition_batches {
-                total_rows += batch.num_rows();
-                all_batches.push(batch);
+                hot_rows += batch.num_rows();
+                hot_data.push(batch);
             }
         }
 
-        // Read cold partitions from spill files
-        for file_opt in cold_files.iter() {
-            if let Some(file) = file_opt {
-                let spill_mgr = crate::spill::spill_manager::SpillManager::new(
-                    Arc::clone(&runtime_env),
-                    crate::metrics::SpillMetrics::new(
-                        &ExecutionPlanMetricsSet::new(), 0,
-                    ),
-                    Arc::clone(&schema),
-                );
-                let mut stream = spill_mgr.read_spill_as_stream(
-                    Arc::clone(file), None,
-                )?;
-                while let Some(batch_result) = stream.next().await {
-                    let batch = batch_result?;
-                    if batch.num_rows() > 0 {
-                        total_rows += batch.num_rows();
-                        all_batches.push(batch);
-                    }
-                }
-            }
-        }
+        state.batches = hot_data;
+        state.num_rows = hot_rows;
 
-        state.batches = all_batches;
-        state.num_rows = total_rows;
-    }
+        Some(super::build_spill::SpilledPartitionMeta {
+            cold_files,
+            spilled_partitions,
+            bit_offset,
+            schema: Arc::clone(&schema),
+            on_left: on_left.clone(),
+            random_state: SeededRandomState::with_seed(12210250226015887276),
+        })
+    } else {
+        None
+    };
 
     // Extract fields from state
     let BuildSideState {
@@ -2531,6 +2528,7 @@ async fn collect_left_input(
         membership,
         probe_side_non_empty: AtomicBool::new(false),
         probe_side_has_null: AtomicBool::new(false),
+        spill_meta,
     };
 
     Ok(data)
@@ -2809,6 +2807,7 @@ fn build_hash_table_from_batches(
         membership,
         probe_side_non_empty: AtomicBool::new(false),
         probe_side_has_null: AtomicBool::new(false),
+        spill_meta: None,
     })
 }
 
