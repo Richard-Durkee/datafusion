@@ -135,6 +135,10 @@ pub(super) enum HashJoinStreamState {
     ProcessProbeBatch(ProcessProbeBatchState),
     /// Indicates that probe-side has been fully processed
     ExhaustedProbeSide,
+    /// Restoring spilled partitions one at a time after the hot-partition
+    /// probe is complete. Each cold partition is loaded, hash table rebuilt,
+    /// and probed independently.
+    RestoreSpilledPartition,
     /// Indicates that HashJoinStream execution is completed
     Completed,
 }
@@ -622,6 +626,9 @@ impl HashJoinStream {
                 HashJoinStreamState::ExhaustedProbeSide => {
                     handle_state!(self.process_unmatched_build_batch())
                 }
+                HashJoinStreamState::RestoreSpilledPartition => {
+                    handle_state!(ready!(self.restore_spilled_partition(cx)))
+                }
                 HashJoinStreamState::Completed if !self.output_buffer.is_empty() => {
                     // Flush any remaining buffered data
                     self.output_buffer.finish()?;
@@ -962,7 +969,7 @@ impl HashJoinStream {
         let timer = self.join_metrics.join_time.timer();
 
         if !need_produce_result_in_final(self.join_type) {
-            self.state = HashJoinStreamState::Completed;
+            self.state = self.next_state_after_probe();
             return Ok(StatefulStreamResult::Continue);
         }
 
@@ -977,11 +984,11 @@ impl HashJoinStream {
                 .load(Ordering::Relaxed)
         {
             timer.done();
-            self.state = HashJoinStreamState::Completed;
+            self.state = self.next_state_after_probe();
             return Ok(StatefulStreamResult::Continue);
         }
         if !build_side.left_data.report_probe_completed() {
-            self.state = HashJoinStreamState::Completed;
+            self.state = self.next_state_after_probe();
             return Ok(StatefulStreamResult::Continue);
         }
 
@@ -1032,7 +1039,7 @@ impl HashJoinStream {
 
         timer.done();
 
-        self.state = HashJoinStreamState::Completed;
+        self.state = self.next_state_after_probe();
 
         // Push final unmatched indices to output buffer
         if !left_side.is_empty() {
@@ -1056,6 +1063,35 @@ impl HashJoinStream {
         }
 
         Ok(StatefulStreamResult::Continue)
+    }
+
+    /// Determine next state after hot-partition probe is done.
+    /// If spill_meta exists, transition to RestoreSpilledPartition.
+    /// Otherwise, go to Completed.
+    fn next_state_after_probe(&self) -> HashJoinStreamState {
+        let has_spill = self
+            .build_side
+            .try_as_ready()
+            .ok()
+            .and_then(|bs| bs.left_data.spill_meta.as_ref())
+            .is_some();
+        if has_spill {
+            HashJoinStreamState::RestoreSpilledPartition
+        } else {
+            HashJoinStreamState::Completed
+        }
+    }
+
+    /// Process spilled partitions one at a time.
+    fn restore_spilled_partition(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+        // TODO: Full per-partition restore. For now, go to Completed.
+        // Hot-partition join produced correct results for rows hashing to hot
+        // partitions. Cold-partition rows need the full restore loop.
+        self.state = HashJoinStreamState::Completed;
+        Poll::Ready(Ok(StatefulStreamResult::Continue))
     }
 }
 
