@@ -221,6 +221,28 @@ async fn sort_merge_join_spill() {
         .await
 }
 
+/// Verifies that HashJoin can complete when the build side exceeds memory
+/// by falling back to grace-hash partitioned spill.
+#[tokio::test]
+async fn hash_join_spill() {
+    // Use single partition to force CollectLeft mode (the spill-enabled path)
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    // Memory limit must be:
+    // - Small enough that the full build side (self-join of 'service' column) OOMs
+    //   during try_fold accumulation
+    // - Large enough that the restored hash table fits (hybrid approach reads
+    //   spilled partitions back after peak accumulation pressure passes)
+    TestCase::new()
+        .with_query("select t1.* from t t1 JOIN t t2 ON t1.service = t2.service")
+        .with_memory_limit(100_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
 #[tokio::test]
 async fn symmetric_hash_join() {
     TestCase::new()
