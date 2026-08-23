@@ -1,0 +1,5 @@
+BUILD_FAILED
+build_time: 653s
+error:           
+
+error: could not compile `datafusion-examples` (example "spill_bench") due to 1 previous error

@@ -1545,6 +1545,7 @@ impl ExecutionPlan for HashJoinExec {
 
         // we have the batches and the hash map with their keys. We can how create a stream
         // over the right that uses this information to issue new batches.
+        let runtime_env = Arc::clone(&context.runtime_env());
         let right_stream = self.right.execute(partition, context)?;
 
         // update column indices to reflect the projection
@@ -1582,6 +1583,7 @@ impl ExecutionPlan for HashJoinExec {
             self.mode,
             self.null_aware,
             self.fetch,
+            Arc::clone(&runtime_env),
         )))
     }
 
@@ -2686,7 +2688,7 @@ async fn collect_left_input_with_spill(
 /// This is the "Phase 2" of collect_left_input extracted for reuse by both
 /// the normal path and the spill-restore path.
 #[expect(clippy::too_many_arguments)]
-fn build_hash_table_from_batches(
+pub(super) fn build_hash_table_from_batches(
     batches: Vec<RecordBatch>,
     num_rows: usize,
     schema: &SchemaRef,

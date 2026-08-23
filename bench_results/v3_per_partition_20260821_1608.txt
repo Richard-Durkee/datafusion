@@ -1,0 +1,25 @@
+=== Hash-Join Spill Benchmark ===
+Rows: 500000
+Memory limit: 10 MB
+
+Data generated: 500000 rows, ~43 MB in memory (0.10s)
+
+Query: self-join on join_key (500K x 500K)
+Plan: "HashJoinExec"
+
+QUERY FAILED after 0.001s: Resources exhausted: Additional allocation failed for HashJoinInput with top memory consumers (across reservations) as:
+  HashJoinInput#0(can spill: false) consumed 7.6 MB, peak 7.6 MB.
+Error: Failed to allocate additional 17.0 MB for HashJoinInput with 7.6 MB already allocated for this reservation - 1915.5 KB remain available for the total memory pool: greedy(used: 7.6 MB, pool_size: 9.5 MB)
+
+--- RESULT ---
+status: FAILED
+error: Resources exhausted: Additional allocation failed for HashJoinInput with top memory consumers (across reservations) as:
+  HashJoinInput#0(can spill: false) consumed 7.6 MB, peak 7.6 MB.
+Error: Failed to allocate additional 17.0 MB for HashJoinInput with 7.6 MB already allocated for this reservation - 1915.5 KB remain available for the total memory pool: greedy(used: 7.6 MB, pool_size: 9.5 MB)
+wall_time_secs: 0.001
+
+--- /usr/bin/time ---
+time_peak_rss_bytes: 52412416
+time_real: 1.09
+build_time_secs: 897
+exit_code: 0
