@@ -343,9 +343,11 @@ pub(super) struct HashJoinStream {
     null_aware: bool,
     /// Runtime environment for spill file I/O during per-partition restore
     runtime_env: Arc<RuntimeEnv>,
-    /// Probe-side spill files per partition (populated during initial probe
-    /// when spill_meta exists, consumed during per-partition restore).
-    /// probe_spill_files[i] = Some(file) if partition i has spilled probe rows.
+    /// Probe-side spill writers per partition (populated during initial probe
+    /// when spill_meta exists, finalized during finalize_probe_spill).
+    /// probe_spill_writers[i] = Some(writer) if partition i has cold probe rows.
+    probe_spill_writers: Option<Vec<Option<crate::spill::in_progress_spill_file::InProgressSpillFile>>>,
+    /// Finalized probe spill files (set by finalize_probe_spill, consumed by restore).
     probe_spill_files: Option<Vec<Option<Arc<dyn datafusion_execution::spill_file::SpillFile>>>>,
     /// Index of the next cold partition to restore (iterates through spill_meta.cold_files)
     next_cold_partition: usize,
@@ -529,6 +531,7 @@ impl HashJoinStream {
             output_buffer,
             null_aware,
             runtime_env,
+            probe_spill_writers: None,
             probe_spill_files: None,
             next_cold_partition: 0,
         }
@@ -1094,9 +1097,9 @@ impl HashJoinStream {
     /// If spill_meta exists, transition to RestoreSpilledPartition.
     /// Otherwise, go to Completed.
     fn next_state_after_probe(&self) -> HashJoinStreamState {
-        // If we're in the middle of per-partition restore (probe_spill_files populated),
+        // If we're in the middle of per-partition restore (probe spill state populated),
         // always loop back to RestoreSpilledPartition until all partitions are done.
-        if self.probe_spill_files.is_some() {
+        if self.probe_spill_files.is_some() || self.probe_spill_writers.is_some() {
             return HashJoinStreamState::RestoreSpilledPartition;
         }
 
@@ -1122,7 +1125,6 @@ impl HashJoinStream {
         batch: RecordBatch,
     ) -> Result<RecordBatch> {
         use super::build_spill::NUM_PARTITIONS;
-        use super::partitioned_hash_eval::SeededRandomState;
 
         let spill_meta = match self
             .build_side
@@ -1137,8 +1139,8 @@ impl HashJoinStream {
         let spilled_partitions = &spill_meta.spilled_partitions;
 
         // Lazily initialize probe spill writers
-        if self.probe_spill_files.is_none() {
-            self.probe_spill_files = Some(vec![None; NUM_PARTITIONS]);
+        if self.probe_spill_writers.is_none() {
+            self.probe_spill_writers = Some((0..NUM_PARTITIONS).map(|_| None).collect());
         }
 
         // Compute partition assignment for each probe row using same hash as build
@@ -1162,7 +1164,7 @@ impl HashJoinStream {
             }
         }
 
-        // Spill cold rows to per-partition files
+        // Spill cold rows to per-partition writers (O(1) append per batch)
         for (part_idx, indices) in cold_by_partition.iter().enumerate() {
             if indices.is_empty() {
                 continue;
@@ -1175,12 +1177,11 @@ impl HashJoinStream {
                 .iter()
                 .map(|col| arrow::compute::take(col, &indices_arr, None).unwrap())
                 .collect();
-            let part_batch =
-                RecordBatch::try_new(batch.schema(), columns)?;
+            let part_batch = RecordBatch::try_new(batch.schema(), columns)?;
 
-            // Get or create spill writer for this partition
-            let probe_files = self.probe_spill_files.as_mut().unwrap();
-            if probe_files[part_idx].is_none() {
+            // Get or create writer for this partition
+            let writers = self.probe_spill_writers.as_mut().unwrap();
+            if writers[part_idx].is_none() {
                 let spill_mgr = crate::spill::spill_manager::SpillManager::new(
                     Arc::clone(&self.runtime_env),
                     crate::metrics::SpillMetrics::new(
@@ -1189,48 +1190,11 @@ impl HashJoinStream {
                     ),
                     batch.schema(),
                 );
-                let mut in_progress = spill_mgr.create_in_progress_file("probe_spill")?;
-                in_progress.append_batch(&part_batch)?;
-                let finished = in_progress.finish()?.expect("spill file should exist after write");
-                probe_files[part_idx] = Some(finished);
-            } else {
-                // Append to existing file — need to create a new file each time
-                // (IPC files are write-once), so we accumulate by chaining.
-                // For simplicity, create new file per batch and we'll handle
-                // multi-file reads in restore. Actually, let's use a single
-                // InProgressSpillFile that stays open.
-                //
-                // SIMPLIFICATION: For now, overwrite with latest batch only.
-                // This loses earlier batches. A proper impl would keep the
-                // InProgressSpillFile open across calls. Deferring that to
-                // avoid holding mutable spill writers in the stream struct.
-                // TODO: accumulate all cold probe batches per partition.
-                let spill_mgr = crate::spill::spill_manager::SpillManager::new(
-                    Arc::clone(&self.runtime_env),
-                    crate::metrics::SpillMetrics::new(
-                        &crate::metrics::ExecutionPlanMetricsSet::new(),
-                        0,
-                    ),
-                    batch.schema(),
+                writers[part_idx] = Some(
+                    spill_mgr.create_in_progress_file("probe_spill")?
                 );
-                let mut in_progress = spill_mgr.create_in_progress_file("probe_spill")?;
-                // Write ALL previous data + new batch. Read old file first.
-                if let Some(old_file) = &probe_files[part_idx] {
-                    let old_batches: Vec<RecordBatch> = {
-                        use arrow::ipc::reader::StreamReader;
-                        let path = old_file.path().expect("local spill file");
-                        let file = std::fs::File::open(path)?;
-                        let reader = StreamReader::try_new(file, None)?;
-                        reader.into_iter().collect::<std::result::Result<Vec<_>, _>>()?
-                    };
-                    for old_batch in old_batches {
-                        in_progress.append_batch(&old_batch)?;
-                    }
-                }
-                in_progress.append_batch(&part_batch)?;
-                let finished = in_progress.finish()?.expect("spill file should exist after write");
-                probe_files[part_idx] = Some(finished);
             }
+            writers[part_idx].as_mut().unwrap().append_batch(&part_batch)?;
         }
 
         // Return only hot rows
@@ -1250,10 +1214,21 @@ impl HashJoinStream {
         Ok(RecordBatch::try_new(batch.schema(), columns)?)
     }
 
-    /// Finalize probe spill state (no-op for now since we finish files eagerly)
+    /// Finalize probe spill writers — finish all open IPC files and store
+    /// the completed file references for per-partition restore.
     fn finalize_probe_spill(&mut self) -> Result<()> {
-        // Files are already finalized in maybe_spill_cold_probe_rows.
-        // This hook exists for future optimization (batch writers).
+        if let Some(writers) = self.probe_spill_writers.take() {
+            let mut files: Vec<Option<Arc<dyn datafusion_execution::spill_file::SpillFile>>> =
+                Vec::with_capacity(writers.len());
+            for writer_opt in writers {
+                if let Some(mut writer) = writer_opt {
+                    files.push(writer.finish()?);
+                } else {
+                    files.push(None);
+                }
+            }
+            self.probe_spill_files = Some(files);
+        }
         Ok(())
     }
 

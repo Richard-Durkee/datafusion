@@ -96,7 +96,6 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 use datafusion_common::hash_utils::RandomState;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
-use futures::TryStreamExt;
 use parking_lot::Mutex;
 
 use super::partitioned_hash_eval::SeededRandomState;
@@ -2429,7 +2428,7 @@ async fn collect_left_input(
             // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
             // `u64` indice variant
             // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
-            let (mut hashmap, batches, num_rows, spill_meta_out) = {
+            let (mut hashmap, batches, _num_rows, spill_meta_out) = {
                 let estimated_hashtable_size = if num_rows > u32::MAX as usize {
                     estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?
                 } else {
@@ -2610,145 +2609,6 @@ async fn collect_left_input(
 /// subsequent per-partition join pass.
 ///
 /// Caller must pass `runtime_env` and `spill_metrics` for SpillManager creation.
-#[expect(clippy::too_many_arguments)]
-async fn collect_left_input_with_spill(
-    random_state: RandomState,
-    seeded_random_state: SeededRandomState,
-    left_stream: SendableRecordBatchStream,
-    on_left: Vec<PhysicalExprRef>,
-    metrics: BuildProbeJoinMetrics,
-    reservation: MemoryReservation,
-    with_visited_indices_bitmap: bool,
-    probe_threads_count: usize,
-    config: Arc<ConfigOptions>,
-    null_equality: NullEquality,
-    runtime_env: Arc<datafusion_execution::runtime_env::RuntimeEnv>,
-    spill_metrics: crate::metrics::SpillMetrics,
-) -> Result<(JoinLeftData, Option<super::build_spill::SpilledPartitionMeta>)> {
-    use super::build_spill::{
-        SpillableBuildResult, collect_left_input_spillable,
-    };
-
-    let schema = left_stream.schema();
-    let result = collect_left_input_spillable(
-        seeded_random_state.clone(),
-        left_stream,
-        on_left.clone(),
-        metrics.clone(),
-        reservation.new_empty(),
-        Arc::clone(&runtime_env),
-        spill_metrics.clone(),
-    )
-    .await?;
-
-    match result {
-        SpillableBuildResult::InMemory { batches, num_rows } => {
-            // Normal path: build hash table from all batches (same as collect_left_input Phase 2)
-            let join_left_data = build_hash_table_from_batches(
-                batches,
-                num_rows,
-                &schema,
-                &on_left,
-                &random_state,
-                &mut reservation.new_empty(),
-                &metrics,
-                with_visited_indices_bitmap,
-                probe_threads_count,
-                &config,
-                null_equality,
-                None,
-                None, // array_map_created_count not tracked in spillable path
-            )?;
-            Ok((join_left_data, None))
-        }
-        SpillableBuildResult::Spilled(partitioner) => {
-            // Spill path: restore cold partitions from disk and merge with
-            // hot partitions to build a complete hash table.
-            //
-            // This is the "hybrid hash join" approach: partitioning survived
-            // the peak memory during accumulation; now we read partitions back
-            // one at a time and merge into the final hash table. Correct for
-            // all join types since the hash table contains all build rows.
-            let spilled_partitions: Vec<bool> = (0..super::build_spill::NUM_PARTITIONS)
-                .map(|i| partitioner.partitions[i].is_spilled)
-                .collect();
-            let bit_offset = partitioner.bit_offset();
-
-            let (hot_batches, cold_files) = partitioner.finish()?;
-
-            // Collect ALL batches: hot (already in memory) + cold (read from disk)
-            let mut all_batches: Vec<RecordBatch> = Vec::new();
-            let mut total_rows = 0;
-
-            // Hot partitions: already in memory
-            for partition_batches in hot_batches {
-                for batch in partition_batches {
-                    total_rows += batch.num_rows();
-                    all_batches.push(batch);
-                }
-            }
-
-            // Cold partitions: read back from spill files one at a time
-            for (p_idx, file_opt) in cold_files.iter().enumerate() {
-                if let Some(file) = file_opt {
-                    let spill_mgr = crate::spill::spill_manager::SpillManager::new(
-                        Arc::clone(&runtime_env),
-                        spill_metrics.clone(),
-                        Arc::clone(&schema),
-                    );
-                    let mut stream = spill_mgr.read_spill_as_stream(
-                        Arc::clone(file), None,
-                    )?;
-
-                    use futures::StreamExt;
-                    // Read all batches from this partition's spill file
-                    while let Some(batch_result) = stream.next().await {
-                        let batch = batch_result?;
-                        if batch.num_rows() > 0 {
-                            total_rows += batch.num_rows();
-                            all_batches.push(batch);
-                        }
-                    }
-                    log::debug!(
-                        "HashJoin spill restore: partition {p_idx} read back"
-                    );
-                }
-            }
-
-            log::info!(
-                "HashJoin spill restore complete: {total_rows} total rows \
-                 ({} partitions were spilled)",
-                spilled_partitions.iter().filter(|&&s| s).count()
-            );
-
-            // Build hash table from ALL rows (hot + restored cold)
-            let join_left_data = build_hash_table_from_batches(
-                all_batches,
-                total_rows,
-                &schema,
-                &on_left,
-                &random_state,
-                &mut reservation.new_empty(),
-                &metrics,
-                with_visited_indices_bitmap,
-                probe_threads_count,
-                &config,
-                null_equality,
-                None,
-                None,
-            )?;
-
-            // No spill metadata needed for probe side — all data is in the
-            // hash table now. Probe proceeds normally against the full table.
-            Ok((join_left_data, None))
-        }
-    }
-}
-
-/// Build a JoinLeftData (hash table + metadata) from pre-collected batches.
-///
-/// This is the "Phase 2" of collect_left_input extracted for reuse by both
-/// the normal path and the spill-restore path.
 #[expect(clippy::too_many_arguments)]
 pub(super) fn build_hash_table_from_batches(
     batches: Vec<RecordBatch>,
