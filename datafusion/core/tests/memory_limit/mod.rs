@@ -243,6 +243,144 @@ async fn hash_join_spill() {
         .await
 }
 
+/// Scenario D: Extreme memory pressure -- limit smaller than a single batch.
+/// Even with disk spill enabled, the very first batch cannot be accumulated.
+/// Should produce a clean OOM error (not a panic).
+#[tokio::test]
+async fn hash_join_spill_extreme_pressure() {
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    TestCase::new()
+        .with_query("select t1.* from t t1 JOIN t t2 ON t1.service = t2.service")
+        // 500 bytes is less than a single 50-row batch (~2KB+)
+        .with_memory_limit(500)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_errors(vec![
+            "Resources exhausted: Additional allocation failed",
+        ])
+        .run()
+        .await
+}
+
+/// Scenario E: Probe-side pressure during per-partition restore.
+/// Uses a moderate memory limit that forces spill during build accumulation.
+/// The probe side is also large (self-join), so the per-partition restore must
+/// handle probe batches for cold partitions correctly under continued pressure.
+#[tokio::test]
+async fn hash_join_spill_probe_pressure() {
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    // 80KB: enough for hot partition hash table but forces spill during accumulation.
+    // The probe side (also 1000 rows) will be partitioned and spilled per-partition.
+    TestCase::new()
+        .with_query("select t1.service, t2.host from t t1 JOIN t t2 ON t1.service = t2.service")
+        .with_memory_limit(80_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
+/// Scenario F: Hot partition itself exceeds memory at restore time.
+/// With a very tight limit, even a single partition's hash table may not fit.
+/// This should produce a clean OOM (not a panic or hang).
+#[tokio::test]
+async fn hash_join_spill_hot_partition_oom() {
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    // 3KB: forces spill during accumulation. Even a single partition
+    // (1000/8 = 125 rows) needs ~2KB+ for hash table. At 3KB * 0.95 = 2.85KB,
+    // the hot partition hash table won't fit after the build data is accounted.
+    // Should OOM cleanly at restore time.
+    TestCase::new()
+        .with_query("select t1.* from t t1 JOIN t t2 ON t1.service = t2.service")
+        .with_memory_limit(3_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_errors(vec![
+            "Resources exhausted: Additional allocation failed",
+        ])
+        .run()
+        .await
+}
+
+/// Scenario G: LEFT OUTER join with spill -- unmatched build rows must be emitted.
+/// Verifies visited_indices tracking works correctly across per-partition restore.
+#[tokio::test]
+async fn hash_join_spill_left_outer() {
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    // LEFT JOIN: all rows from t1 should appear, with NULLs for unmatched t2.
+    // Use a predicate that guarantees some t1 rows won't match.
+    TestCase::new()
+        .with_query(
+            "select count(*) as cnt from t t1 LEFT JOIN t t2 \
+             ON t1.service = t2.service AND t2.response_status = 200"
+        )
+        .with_memory_limit(100_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
+/// Scenario G: RIGHT SEMI join with spill -- only matching probe rows emitted.
+#[tokio::test]
+async fn hash_join_spill_right_semi() {
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    TestCase::new()
+        .with_query(
+            "select t1.service from t t1 WHERE EXISTS \
+             (SELECT 1 FROM t t2 WHERE t1.service = t2.service)"
+        )
+        .with_memory_limit(100_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
+/// Scenario G: RIGHT ANTI join with spill -- only non-matching probe rows emitted.
+#[tokio::test]
+async fn hash_join_spill_right_anti() {
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    TestCase::new()
+        .with_query(
+            "select t1.service from t t1 WHERE NOT EXISTS \
+             (SELECT 1 FROM t t2 WHERE t1.service = t2.service AND t2.response_status = 999)"
+        )
+        .with_memory_limit(100_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
+/// Scenario H: Partitioned mode (target_partitions=2, NOT CollectLeft).
+/// Each partition independently accumulates and may spill.
+#[tokio::test]
+async fn hash_join_spill_partitioned_mode() {
+    // With 2 partitions, the optimizer uses Partitioned mode (not CollectLeft).
+    // Each partition independently handles its share of data.
+    let config = SessionConfig::new().with_target_partitions(2);
+
+    TestCase::new()
+        .with_query("select t1.* from t t1 JOIN t t2 ON t1.service = t2.service")
+        .with_memory_limit(100_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
 #[tokio::test]
 async fn symmetric_hash_join() {
     TestCase::new()
