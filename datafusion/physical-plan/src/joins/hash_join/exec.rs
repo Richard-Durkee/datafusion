@@ -2351,7 +2351,7 @@ async fn collect_left_input(
     // If spill was triggered, build hash table from hot partitions only.
     // Cold partitions are attached as spill_meta for per-partition restore
     // in the stream's probe phase.
-    let spill_meta = if let Some(p) = partitioner {
+    let mut spill_meta = if let Some(p) = partitioner {
         let spilled_partitions: Vec<bool> = (0..super::build_spill::NUM_PARTITIONS)
             .map(|i| p.partitions[i].is_spilled)
             .collect();
@@ -2429,19 +2429,81 @@ async fn collect_left_input(
             // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
             // `u64` indice variant
             // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
-            let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
-                let estimated_hashtable_size =
-                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-                reservation.try_grow(estimated_hashtable_size)?;
-                metrics.build_mem_used.add(estimated_hashtable_size);
-                Box::new(JoinHashMapU64::with_capacity(num_rows))
-            } else {
-                let estimated_hashtable_size =
-                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-                reservation.try_grow(estimated_hashtable_size)?;
-                metrics.build_mem_used.add(estimated_hashtable_size);
-                Box::new(JoinHashMapU32::with_capacity(num_rows))
+            let (mut hashmap, batches, num_rows, spill_meta_out) = {
+                let estimated_hashtable_size = if num_rows > u32::MAX as usize {
+                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?
+                } else {
+                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?
+                };
+
+                // If hash table doesn't fit, spill to reduce data to hot partition only
+                let (final_batches, final_num_rows, spill_meta) =
+                    if reservation.try_grow(estimated_hashtable_size).is_ok() {
+                        metrics.build_mem_used.add(estimated_hashtable_size);
+                        (batches, num_rows, None)
+                    } else if runtime_env.disk_manager.tmp_files_enabled() {
+                        // Spill: partition existing batches, keep only hot partition
+                        reservation.resize(0);
+                        let spill_mgr = crate::spill::spill_manager::SpillManager::new(
+                            Arc::clone(&runtime_env),
+                            crate::metrics::SpillMetrics::new(
+                                &ExecutionPlanMetricsSet::new(), 0,
+                            ),
+                            Arc::clone(&schema),
+                        );
+                        let mut partitioner = super::build_spill::BuildPartitioner::new(
+                            Arc::clone(&schema),
+                            spill_mgr,
+                            on_left.clone(),
+                            SeededRandomState::with_seed(
+                                12210250226015887276,
+                            ),
+                        );
+                        for batch in batches {
+                            partitioner.insert_batch(batch)?;
+                        }
+                        // Spill all but the smallest partition to disk
+                        // (keep one as hot so the hash table has data)
+                        let num_partitions = super::build_spill::NUM_PARTITIONS;
+                        for _ in 0..(num_partitions - 1) {
+                            if partitioner.spill_largest_partition()? == 0 {
+                                break;
+                            }
+                        }
+                        let (hot_batches, meta) = partitioner.finish_with_spill_meta(
+                            &on_left,
+                        )?;
+                        let hot_rows: usize = hot_batches.iter().map(|b| b.num_rows()).sum();
+
+                        // Re-estimate hash table for hot partition only
+                        let hot_ht_size = if hot_rows > u32::MAX as usize {
+                            estimate_memory_size::<(u64, u64)>(hot_rows, fixed_size_u64)?
+                        } else {
+                            estimate_memory_size::<(u32, u64)>(hot_rows, fixed_size_u32)?
+                        };
+                        reservation.try_grow(hot_ht_size)?;
+                        metrics.build_mem_used.add(hot_ht_size);
+                        (hot_batches, hot_rows, Some(meta))
+                    } else {
+                        // No disk — propagate the OOM
+                        reservation.try_grow(estimated_hashtable_size)?;
+                        unreachable!()
+                    };
+
+                let map: Box<dyn JoinHashMapType> = if final_num_rows > u32::MAX as usize {
+                    Box::new(JoinHashMapU64::with_capacity(final_num_rows))
+                } else {
+                    Box::new(JoinHashMapU32::with_capacity(final_num_rows))
+                };
+                (map, final_batches, final_num_rows, spill_meta)
             };
+
+            // If hash-table-phase spill produced metadata, override the
+            // accumulation-phase spill_meta (which would be None if no
+            // accumulation spill occurred).
+            if spill_meta_out.is_some() {
+                spill_meta = spill_meta_out;
+            }
 
             let mut hashes_buffer = Vec::new();
             let mut offset = 0;

@@ -411,6 +411,45 @@ impl BuildPartitioner {
         Ok((self.hot_batches, cold_files))
     }
 
+    /// Finish partitioning, returning flattened hot-partition batches and a
+    /// SpilledPartitionMeta for the stream's per-partition restore loop.
+    pub fn finish_with_spill_meta(
+        mut self,
+        on_left: &[PhysicalExprRef],
+    ) -> Result<(Vec<RecordBatch>, SpilledPartitionMeta)> {
+        let spilled_partitions: Vec<bool> = self.partitions.iter()
+            .map(|p| p.is_spilled)
+            .collect();
+        let bit_offset = self.bit_offset();
+
+        let mut cold_files: Vec<Option<Arc<dyn SpillFile>>> =
+            Vec::with_capacity(NUM_PARTITIONS);
+        for p in &mut self.partitions {
+            if let Some(mut file) = p.file.take() {
+                cold_files.push(file.finish()?);
+            } else {
+                cold_files.push(None);
+            }
+        }
+
+        // Flatten hot batches from all partitions
+        let mut hot_batches_flat = Vec::new();
+        for partition_batches in self.hot_batches {
+            hot_batches_flat.extend(partition_batches);
+        }
+
+        let meta = SpilledPartitionMeta {
+            cold_files,
+            spilled_partitions,
+            bit_offset,
+            schema: Arc::clone(&self.schema),
+            on_left: on_left.to_vec(),
+            random_state: self.random_state.clone(),
+        };
+
+        Ok((hot_batches_flat, meta))
+    }
+
     /// Get the schema of the build side.
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
