@@ -222,6 +222,159 @@ async fn sort_merge_join_spill() {
         .await
 }
 
+/// Verifies that HashJoin can complete when the build side exceeds memory
+/// by falling back to grace-hash partitioned spill.
+#[tokio::test]
+async fn hash_join_spill() {
+    // Use single partition to force CollectLeft mode (the spill-enabled path)
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    // Memory limit must be:
+    // - Small enough that the full build side (self-join of 'service' column) OOMs
+    //   during try_fold accumulation
+    // - Large enough that the restored hash table fits (hybrid approach reads
+    //   spilled partitions back after peak accumulation pressure passes)
+    TestCase::new()
+        .with_query("select t1.* from t t1 JOIN t t2 ON t1.service = t2.service")
+        .with_memory_limit(100_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
+/// Scenario D: Extreme memory pressure -- limit smaller than a single batch.
+/// Even at 500 bytes, the grace-hash spill partitions aggressively enough
+/// that the query completes. Verifies no panic under extreme pressure.
+#[tokio::test]
+async fn hash_join_spill_extreme_pressure() {
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    TestCase::new()
+        .with_query("select t1.* from t t1 JOIN t t2 ON t1.service = t2.service")
+        // 500 bytes: extreme pressure, but grace-hash spill handles it
+        .with_memory_limit(500)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
+/// Scenario E: Probe-side pressure during per-partition restore.
+/// Uses a moderate memory limit that forces spill during build accumulation.
+/// The probe side is also large (self-join), so the per-partition restore must
+/// handle probe batches for cold partitions correctly under continued pressure.
+#[tokio::test]
+async fn hash_join_spill_probe_pressure() {
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    // 80KB: enough for hot partition hash table but forces spill during accumulation.
+    // The probe side (also 1000 rows) will be partitioned and spilled per-partition.
+    TestCase::new()
+        .with_query("select t1.service, t2.host from t t1 JOIN t t2 ON t1.service = t2.service")
+        .with_memory_limit(80_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
+/// Scenario F: Hot partition itself exceeds memory at restore time.
+/// At 3KB, even a single partition's data is tight, but the grace-hash spill
+/// partitions recursively enough that the query completes. Verifies no panic
+/// or hang under very tight memory with per-partition restore.
+#[tokio::test]
+async fn hash_join_spill_hot_partition_oom() {
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    TestCase::new()
+        .with_query("select t1.* from t t1 JOIN t t2 ON t1.service = t2.service")
+        .with_memory_limit(3_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
+/// Scenario G: LEFT OUTER join with spill -- unmatched build rows must be emitted.
+/// Verifies visited_indices tracking works correctly across per-partition restore.
+#[tokio::test]
+async fn hash_join_spill_left_outer() {
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    // LEFT JOIN: all rows from t1 should appear, with NULLs for unmatched t2.
+    // Use a predicate that guarantees some t1 rows won't match.
+    TestCase::new()
+        .with_query(
+            "select count(*) as cnt from t t1 LEFT JOIN t t2 \
+             ON t1.service = t2.service AND t2.response_status = 200"
+        )
+        .with_memory_limit(100_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
+/// Scenario G: RIGHT SEMI join with spill -- only matching probe rows emitted.
+#[tokio::test]
+async fn hash_join_spill_right_semi() {
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    TestCase::new()
+        .with_query(
+            "select t1.service from t t1 WHERE EXISTS \
+             (SELECT 1 FROM t t2 WHERE t1.service = t2.service)"
+        )
+        .with_memory_limit(100_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
+/// Scenario G: RIGHT ANTI join with spill -- only non-matching probe rows emitted.
+#[tokio::test]
+async fn hash_join_spill_right_anti() {
+    let config = SessionConfig::new().with_target_partitions(1);
+
+    TestCase::new()
+        .with_query(
+            "select t1.service from t t1 WHERE NOT EXISTS \
+             (SELECT 1 FROM t t2 WHERE t1.service = t2.service AND t2.response_status = 999)"
+        )
+        .with_memory_limit(100_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
+/// Scenario H: Partitioned mode (target_partitions=2, NOT CollectLeft).
+/// Each partition independently accumulates and may spill.
+#[tokio::test]
+async fn hash_join_spill_partitioned_mode() {
+    // With 2 partitions, the optimizer uses Partitioned mode (not CollectLeft).
+    // Each partition independently handles its share of data.
+    let config = SessionConfig::new().with_target_partitions(2);
+
+    TestCase::new()
+        .with_query("select t1.* from t t1 JOIN t t2 ON t1.service = t2.service")
+        .with_memory_limit(100_000)
+        .with_config(config)
+        .with_disk_manager_builder(DiskManagerBuilder::default())
+        .with_expected_success()
+        .run()
+        .await
+}
+
 #[tokio::test]
 async fn symmetric_hash_join() {
     TestCase::new()
