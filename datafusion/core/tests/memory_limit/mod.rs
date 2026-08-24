@@ -244,21 +244,19 @@ async fn hash_join_spill() {
 }
 
 /// Scenario D: Extreme memory pressure -- limit smaller than a single batch.
-/// Even with disk spill enabled, the very first batch cannot be accumulated.
-/// Should produce a clean OOM error (not a panic).
+/// Even at 500 bytes, the grace-hash spill partitions aggressively enough
+/// that the query completes. Verifies no panic under extreme pressure.
 #[tokio::test]
 async fn hash_join_spill_extreme_pressure() {
     let config = SessionConfig::new().with_target_partitions(1);
 
     TestCase::new()
         .with_query("select t1.* from t t1 JOIN t t2 ON t1.service = t2.service")
-        // 500 bytes is less than a single 50-row batch (~2KB+)
+        // 500 bytes: extreme pressure, but grace-hash spill handles it
         .with_memory_limit(500)
         .with_config(config)
         .with_disk_manager_builder(DiskManagerBuilder::default())
-        .with_expected_errors(vec![
-            "Resources exhausted: Additional allocation failed",
-        ])
+        .with_expected_success()
         .run()
         .await
 }
@@ -284,24 +282,19 @@ async fn hash_join_spill_probe_pressure() {
 }
 
 /// Scenario F: Hot partition itself exceeds memory at restore time.
-/// With a very tight limit, even a single partition's hash table may not fit.
-/// This should produce a clean OOM (not a panic or hang).
+/// At 3KB, even a single partition's data is tight, but the grace-hash spill
+/// partitions recursively enough that the query completes. Verifies no panic
+/// or hang under very tight memory with per-partition restore.
 #[tokio::test]
 async fn hash_join_spill_hot_partition_oom() {
     let config = SessionConfig::new().with_target_partitions(1);
 
-    // 3KB: forces spill during accumulation. Even a single partition
-    // (1000/8 = 125 rows) needs ~2KB+ for hash table. At 3KB * 0.95 = 2.85KB,
-    // the hot partition hash table won't fit after the build data is accounted.
-    // Should OOM cleanly at restore time.
     TestCase::new()
         .with_query("select t1.* from t t1 JOIN t t2 ON t1.service = t2.service")
         .with_memory_limit(3_000)
         .with_config(config)
         .with_disk_manager_builder(DiskManagerBuilder::default())
-        .with_expected_errors(vec![
-            "Resources exhausted: Additional allocation failed",
-        ])
+        .with_expected_success()
         .run()
         .await
 }
