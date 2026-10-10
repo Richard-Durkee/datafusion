@@ -19,10 +19,11 @@
 
 use std::sync::Arc;
 
+use super::peak_reservation::PeakTrackedReservation;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result, internal_err};
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::{TaskContext, TryEmitter, async_try_stream};
 use futures::stream::StreamExt;
 
@@ -56,7 +57,7 @@ use crate::{InputOrderMode, SendableRecordBatchStream};
 /// - After input ends, merge the sorted runs and replay them through a fully
 ///   ordered final aggregate stream.
 pub(crate) struct OrderedFinalAggregateStream {
-    reservation: MemoryReservation,
+    reservation: PeakTrackedReservation,
     context: OrderedFinalAggregateContext,
     stage: ExecutionStage,
 }
@@ -124,6 +125,8 @@ impl OrderedFinalAggregateStream {
                 // Bug issue: https://github.com/apache/datafusion/issues/17334
                 .with_can_spill(true)
                 .register(context.memory_pool());
+        let reservation =
+            PeakTrackedReservation::new(reservation, &agg.metrics, partition);
         Self::new_with_input_and_metrics(
             agg,
             context,
@@ -153,7 +156,7 @@ impl OrderedFinalAggregateStream {
         baseline_metrics: BaselineMetrics,
         metrics: OrderedAggregateTableMetrics,
         spill_metrics: Option<SpillMetrics>,
-        reservation: MemoryReservation,
+        reservation: PeakTrackedReservation,
     ) -> Result<Self> {
         debug_assert!(matches!(
             agg.mode,
@@ -324,7 +327,7 @@ impl Aggregating {
     async fn handle_stage(
         mut self,
         context: &OrderedFinalAggregateContext,
-        reservation: &MemoryReservation,
+        reservation: &PeakTrackedReservation,
     ) -> Result<Option<ExecutionStage>> {
         let elapsed_compute = context.baseline_metrics.elapsed_compute();
 
@@ -381,7 +384,7 @@ impl Aggregating {
             let stream = (*spill_context).into_replay_stream(
                 &context.baseline_metrics.intermediate(),
                 metrics,
-                reservation.new_empty(),
+                reservation.new_empty_tracked(),
             )?;
             timer.done();
             return Ok(Some(ExecutionStage::MergingSpills(stream)));
@@ -407,7 +410,7 @@ impl Outputting {
     async fn handle_stage(
         self,
         context: &OrderedFinalAggregateContext,
-        reservation: &MemoryReservation,
+        reservation: &PeakTrackedReservation,
         emitter: &mut TryEmitter<RecordBatch, DataFusionError>,
     ) -> Result<Option<ExecutionStage>> {
         let Self { mut batch, resume } = self;

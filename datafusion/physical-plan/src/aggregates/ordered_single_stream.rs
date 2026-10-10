@@ -21,11 +21,12 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use super::peak_reservation::PeakTrackedReservation;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::memory_pool::MemoryConsumer;
 use futures::stream::{Stream, StreamExt};
 
 use super::aggregate_hash_table::{OrderedAggregateTable, SingleMarker};
@@ -101,7 +102,7 @@ use crate::{InputOrderMode, RecordBatchStream, SendableRecordBatchStream};
 pub(crate) struct OrderedSingleAggregateStream {
     schema: SchemaRef,
     input: SendableRecordBatchStream,
-    reservation: MemoryReservation,
+    reservation: PeakTrackedReservation,
     baseline_metrics: BaselineMetrics,
     batch_size: usize,
     state: Option<OrderedSingleAggregateState>,
@@ -202,6 +203,8 @@ impl OrderedSingleAggregateStream {
             MemoryConsumer::new(format!("OrderedSingleAggregateStream[{partition}]"))
                 .with_can_spill(can_spill)
                 .register(context.memory_pool());
+        let reservation =
+            PeakTrackedReservation::new(reservation, &agg.metrics, partition);
 
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
         reservation.try_grow(table.memory_size())?;
@@ -516,7 +519,7 @@ impl OrderedSingleAggregateStream {
                     Ok(()) => (*spill_context).into_replay_stream(
                         &self.baseline_metrics,
                         metrics,
-                        self.reservation.new_empty(),
+                        self.reservation.new_empty_tracked(),
                     ),
                     Err(e) => Err(e),
                 }

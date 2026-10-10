@@ -19,10 +19,11 @@
 
 use std::sync::Arc;
 
+use super::peak_reservation::PeakTrackedReservation;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::{TaskContext, TryEmitter, async_try_stream};
 use futures::stream::{Stream, StreamExt};
 
@@ -84,7 +85,7 @@ pub(crate) struct PartialReduceHashAggregateStream {
     baseline_metrics: BaselineMetrics,
 
     /// Memory reservation for group keys and accumulators.
-    reservation: MemoryReservation,
+    reservation: PeakTrackedReservation,
 
     /// Number of times accumulated states were emitted due to memory pressure.
     early_emit_count: Count,
@@ -135,6 +136,8 @@ impl PartialReduceHashAggregateStream {
                 // to ensure fair application of back pressure amongst the memory consumers.
                 .with_can_spill(true)
                 .register(context.memory_pool());
+        let reservation =
+            PeakTrackedReservation::new(reservation, &agg.metrics, partition);
 
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
         reservation.try_grow(hash_table.memory_size())?;

@@ -713,3 +713,48 @@ drop table cat_tracking;
 
 statement ok
 reset datafusion.execution.parquet.pushdown_filters;
+
+# ------------------------------------------------
+# Grouped aggregation reports peak_mem_used
+# ------------------------------------------------
+# The default aggregation streams and the legacy fallback
+# (enable_migration_aggregate = false) both report the peak memory they reserved.
+
+statement ok
+set datafusion.execution.target_partitions = 1;
+
+statement ok
+set datafusion.explain.analyze_categories = 'bytes';
+
+statement ok
+CREATE TABLE agg_peak AS VALUES (1, 10), (2, 20), (1, 30), (3, 40);
+
+query TT
+explain analyze select column1, sum(column2) from agg_peak group by column1;
+----
+Plan with Metrics
+01)AggregateExec: mode=Single, gby=[column1@0 as column1], aggr=[sum(agg_peak.column2)], metrics=[output_bytes=<slt:ignore>, spilled_bytes=0.0 B, peak_mem_used=<slt:ignore>]
+02)--DataSourceExec: partitions=1, partition_sizes=[1], metrics=[]
+
+statement ok
+set datafusion.execution.enable_migration_aggregate = false;
+
+query TT
+explain analyze select column1, sum(column2) from agg_peak group by column1;
+----
+Plan with Metrics
+01)AggregateExec: mode=Single, gby=[column1@0 as column1], aggr=[sum(agg_peak.column2)], metrics=[output_bytes=<slt:ignore>, spilled_bytes=0.0 B, peak_mem_used=<slt:ignore>]
+02)--DataSourceExec: partitions=1, partition_sizes=[1], metrics=[]
+
+statement ok
+reset datafusion.execution.enable_migration_aggregate;
+
+statement ok
+drop table agg_peak;
+
+statement ok
+reset datafusion.explain.analyze_categories;
+
+# The SLT runner uses 4 target partitions, so restore that rather than `reset`.
+statement ok
+set datafusion.execution.target_partitions = 4;

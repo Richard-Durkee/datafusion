@@ -19,11 +19,11 @@
 
 use std::sync::Arc;
 
+use super::peak_reservation::PeakTrackedReservation;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, internal_err};
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_physical_expr::PhysicalSortExpr;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -254,7 +254,7 @@ impl AggregateSpill {
         self,
         baseline_metrics: &BaselineMetrics,
         metrics: OrderedAggregateTableMetrics,
-        reservation: MemoryReservation,
+        reservation: PeakTrackedReservation,
     ) -> Result<SendableRecordBatchStream> {
         let Self {
             replay_agg,

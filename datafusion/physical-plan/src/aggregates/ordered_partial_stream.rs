@@ -19,10 +19,11 @@
 
 use std::sync::Arc;
 
+use super::peak_reservation::PeakTrackedReservation;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result};
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::{TaskContext, TryEmitter, async_try_stream};
 use futures::stream::StreamExt;
 
@@ -105,7 +106,7 @@ use crate::{InputOrderMode, SendableRecordBatchStream, metrics};
 ///   remaining states, performs a sort-preserving merge of all runs, and feeds the
 ///   merged input into a fully ordered final aggregate stream.
 pub(crate) struct OrderedPartialAggregateStream {
-    reservation: MemoryReservation,
+    reservation: PeakTrackedReservation,
     context: OrderedPartialAggregateContext,
     stage: ExecutionStage,
 }
@@ -169,6 +170,8 @@ impl OrderedPartialAggregateStream {
                     GroupOrdering::Partial(_)
                 ))
                 .register(context.memory_pool());
+        let reservation =
+            PeakTrackedReservation::new(reservation, &agg.metrics, partition);
 
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
         reservation.try_grow(table.memory_size())?;
@@ -303,7 +306,7 @@ impl Aggregating {
     async fn handle_stage(
         mut self,
         context: &OrderedPartialAggregateContext,
-        reservation: &MemoryReservation,
+        reservation: &PeakTrackedReservation,
     ) -> Result<Option<ExecutionStage>> {
         let elapsed_compute = context.baseline_metrics.elapsed_compute();
 
@@ -368,7 +371,7 @@ impl Outputting {
     async fn handle_stage(
         self,
         context: &OrderedPartialAggregateContext,
-        reservation: &MemoryReservation,
+        reservation: &PeakTrackedReservation,
         emitter: &mut TryEmitter<RecordBatch, DataFusionError>,
     ) -> Result<Option<ExecutionStage>> {
         let Self { mut batch, resume } = self;

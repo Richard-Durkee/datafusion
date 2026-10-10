@@ -22,10 +22,11 @@
 use std::mem::size_of;
 use std::sync::Arc;
 
+use super::peak_reservation::PeakTrackedReservation;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result, assert_ne_or_internal_err};
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::{TaskContext, TryEmitter, async_try_stream};
 use futures::stream::StreamExt;
 
@@ -114,7 +115,7 @@ use crate::{InputOrderMode, SendableRecordBatchStream};
 pub(crate) struct SingleHashAggregateStream {
     /// Covers group keys, accumulators, and spill sorting; replay reuses it
     /// through a sibling reservation.
-    reservation: MemoryReservation,
+    reservation: PeakTrackedReservation,
     context: SingleHashAggregateContext,
     stage: ExecutionStage,
 }
@@ -205,6 +206,8 @@ impl SingleHashAggregateStream {
             MemoryConsumer::new(format!("SingleHashAggregateStream[{partition}]"))
                 .with_can_spill(can_spill)
                 .register(context.memory_pool());
+        let reservation =
+            PeakTrackedReservation::new(reservation, &agg.metrics, partition);
 
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
         reservation.try_grow(hash_table.memory_size())?;
@@ -342,7 +345,7 @@ impl Aggregating {
     async fn handle_stage(
         mut self,
         context: &SingleHashAggregateContext,
-        reservation: &MemoryReservation,
+        reservation: &PeakTrackedReservation,
     ) -> Result<Option<ExecutionStage>> {
         debug_assert!(self.hash_table.is_building());
         let elapsed_compute = context.baseline_metrics.elapsed_compute();
@@ -405,7 +408,7 @@ impl Aggregating {
             let stream = spill_context.into_replay_stream(
                 &context.baseline_metrics.intermediate(),
                 metrics,
-                reservation.new_empty(),
+                reservation.new_empty_tracked(),
             )?;
             return Ok(Some(ExecutionStage::MergingSpills(stream)));
         }
@@ -423,7 +426,7 @@ impl Outputting {
     async fn handle_stage(
         self,
         context: &SingleHashAggregateContext,
-        reservation: &MemoryReservation,
+        reservation: &PeakTrackedReservation,
         emitter: &mut TryEmitter<RecordBatch, DataFusionError>,
     ) -> Result<Option<ExecutionStage>> {
         let Self { mut hash_table } = self;

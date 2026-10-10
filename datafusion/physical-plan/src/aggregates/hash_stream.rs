@@ -23,12 +23,13 @@
 use std::mem::size_of;
 use std::sync::Arc;
 
+use super::peak_reservation::PeakTrackedReservation;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{
     DataFusionError, Result, assert_ne_or_internal_err, internal_datafusion_err,
 };
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::{TaskContext, TryEmitter, async_try_stream};
 use futures::stream::{Stream, StreamExt};
 
@@ -148,7 +149,7 @@ pub(crate) struct PartialHashAggregateStream {
     batch_size: usize,
 
     /// Memory reservation for group keys and accumulators.
-    reservation: MemoryReservation,
+    reservation: PeakTrackedReservation,
 
     /// Execution metrics shared with the aggregate plan node.
     baseline_metrics: BaselineMetrics,
@@ -187,7 +188,7 @@ pub(crate) struct FinalHashAggregateStream {
     baseline_metrics: BaselineMetrics,
 
     /// Memory reservation for group keys, accumulators, and spill sorting.
-    reservation: MemoryReservation,
+    reservation: PeakTrackedReservation,
 
     /// See comments for the same variable in [`PartialHashAggregateStream`].
     group_values_soft_limit: Option<usize>,
@@ -267,6 +268,8 @@ impl PartialHashAggregateStream {
                 // to ensure fair application of back pressure amongst the memory consumers.
                 .with_can_spill(true)
                 .register(context.memory_pool());
+        let reservation =
+            PeakTrackedReservation::new(reservation, &agg.metrics, partition);
 
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
         reservation.try_grow(hash_table.memory_size())?;
@@ -594,6 +597,8 @@ impl FinalHashAggregateStream {
             MemoryConsumer::new(format!("FinalHashAggregateStream[{partition}]"))
                 .with_can_spill(can_spill)
                 .register(context.memory_pool());
+        let reservation =
+            PeakTrackedReservation::new(reservation, &agg.metrics, partition);
 
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
         reservation.try_grow(hash_table.memory_size())?;
@@ -809,7 +814,7 @@ impl FinalHashAggregateStream {
         spill_context.into_replay_stream(
             &self.baseline_metrics,
             metrics,
-            self.reservation.new_empty(),
+            self.reservation.new_empty_tracked(),
         )
     }
 

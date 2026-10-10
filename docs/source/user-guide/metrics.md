@@ -78,7 +78,7 @@ metrics below, and a timer per aggregate expression and execution phase.
 | spill_count                | Number of spill files written when the aggregation exceeds its memory budget.                                                         |
 | spilled_bytes              | Total number of bytes written to spill files.                                                                                         |
 | spilled_rows               | Total number of rows written to spill files.                                                                                          |
-| peak_mem_used              | Peak tracked memory held by the grouped aggregation, in bytes; recorded by the fallback grouped hash path only.                       |
+| peak_mem_used              | Peak memory reserved by the grouped aggregation, in bytes.                                                                            |
 
 These operator-level metrics are recorded by the grouped aggregation paths
 only: an `AggregateExec` without a `GROUP BY` reports just `BaselineMetrics`

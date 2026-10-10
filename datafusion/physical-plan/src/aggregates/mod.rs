@@ -222,6 +222,7 @@ mod ordered_final_stream;
 mod ordered_partial_stream;
 mod ordered_single_stream;
 mod partial_reduce_stream;
+mod peak_reservation;
 mod single_stream;
 mod skip_partial;
 mod spill;
