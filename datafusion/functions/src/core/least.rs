@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-use crate::core::greatest_least_utils::GreatestLeastOperator;
+use crate::core::greatest_least_utils::{GreatestLeastOperator, keep_lhs_unless_null};
 use arrow::array::{Array, BooleanArray, make_comparator};
 use arrow::buffer::BooleanBuffer;
 use arrow::compute::SortOptions;
@@ -95,15 +95,10 @@ impl GreatestLeastOperator for LeastFunc {
     /// Return boolean array where `arr[i] = lhs[i] <= rhs[i]` for all i, where `arr` is the result array
     /// Nulls are always considered larger than any other value
     fn get_indexes_to_keep(lhs: &dyn Array, rhs: &dyn Array) -> Result<BooleanArray> {
-        // Fast path:
-        // If both arrays are not nested, have the same length and no nulls, we can use the faster vectorized kernel
-        // - If both arrays are not nested: Nested types, such as lists, are not supported as the null semantics are not well-defined.
-        // - both array does not have any nulls: cmp::lt_eq will return null if any of the input is null while we want to return false in that case
-        if !lhs.data_type().is_nested()
-            && lhs.logical_null_count() == 0
-            && rhs.logical_null_count() == 0
-        {
-            return cmp::lt_eq(&lhs, &rhs).map_err(|e| e.into());
+        // Nested types, such as lists, have no vectorized comparison kernel
+        if !lhs.data_type().is_nested() {
+            let comparison = cmp::lt_eq(&lhs, &rhs)?;
+            return Ok(keep_lhs_unless_null(lhs, rhs, comparison));
         }
 
         let cmp = make_comparator(lhs, rhs, SORT_OPTIONS)?;

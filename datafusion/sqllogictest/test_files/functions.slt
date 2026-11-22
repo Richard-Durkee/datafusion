@@ -1608,6 +1608,28 @@ Infinity
 statement ok
 drop table t1
 
+statement ok
+CREATE TABLE t1 (a varchar, b varchar, c varchar) as VALUES
+('b', NULL, NULL),
+('a', 'b', 'c'),
+('c', 'a', 'b'),
+('b', NULL, 'a'),
+(NULL, NULL, NULL),
+(NULL, 'b', NULL);
+
+query T
+SELECT greatest(a, b, c) FROM t1
+----
+b
+c
+c
+b
+NULL
+b
+
+statement ok
+drop table t1
+
 # test for least
 statement ok
 CREATE TABLE t1 (a int, b int, c int) as VALUES
@@ -1802,6 +1824,28 @@ SELECT least(a, b, c) FROM t1
 1
 Infinity
 1
+
+statement ok
+drop table t1
+
+statement ok
+CREATE TABLE t1 (a varchar, b varchar, c varchar) as VALUES
+('b', NULL, NULL),
+('a', 'b', 'c'),
+('c', 'a', 'b'),
+('b', NULL, 'a'),
+(NULL, NULL, NULL),
+(NULL, 'b', NULL);
+
+query T
+SELECT least(a, b, c) FROM t1
+----
+b
+a
+a
+a
+NULL
+b
 
 statement ok
 drop table t1

@@ -22,6 +22,31 @@ pub(super) trait GreatestLeastOperator {
     fn get_indexes_to_keep(lhs: &dyn Array, rhs: &dyn Array) -> Result<BooleanArray>;
 }
 
+/// Turns a comparison of `lhs` and `rhs` into the rows to keep from `lhs`,
+/// with a NULL ordered after every other value by the comparison.
+///
+/// The comparison kernels return NULL when either side is NULL. We keep `lhs`
+/// when it is not NULL and either wins the comparison or `rhs` is NULL.
+pub(super) fn keep_lhs_unless_null(
+    lhs: &dyn Array,
+    rhs: &dyn Array,
+    comparison: BooleanArray,
+) -> BooleanArray {
+    let (lhs_wins, _) = comparison.into_parts();
+    let lhs_valid = lhs.logical_nulls().filter(|n| n.null_count() > 0);
+    let rhs_valid = rhs.logical_nulls().filter(|n| n.null_count() > 0);
+
+    let keep_lhs = match (lhs_valid, rhs_valid) {
+        (None, None) => lhs_wins,
+        (Some(lhs_valid), None) => lhs_valid.inner() & &lhs_wins,
+        (None, Some(rhs_valid)) => &lhs_wins | &!rhs_valid.inner(),
+        (Some(lhs_valid), Some(rhs_valid)) => {
+            lhs_valid.inner() & &(&lhs_wins | &!rhs_valid.inner())
+        }
+    };
+    BooleanArray::new(keep_lhs, None)
+}
+
 fn keep_array<Op: GreatestLeastOperator>(
     lhs: &dyn Array,
     rhs: &dyn Array,

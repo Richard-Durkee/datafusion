@@ -12,9 +12,15 @@
 use criterion::criterion_main;
 
 mod get_field;
+mod greatest_least;
 #[path = "../helper.rs"]
 mod helper;
 mod nullif;
 mod overlay;
 
-criterion_main!(get_field::benches, nullif::benches, overlay::benches);
+criterion_main!(
+    get_field::benches,
+    greatest_least::benches,
+    nullif::benches,
+    overlay::benches
+);
