@@ -225,6 +225,11 @@ impl WindowUDFExpr {
     pub fn args(&self) -> &[Arc<dyn PhysicalExpr>] {
         &self.args
     }
+
+    /// Returns `true` if `IGNORE NULLS` is defined, `false` otherwise.
+    pub fn ignore_nulls(&self) -> bool {
+        self.ignore_nulls
+    }
 }
 
 impl StandardWindowFunctionExpr for WindowUDFExpr {

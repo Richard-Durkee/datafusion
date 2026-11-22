@@ -293,3 +293,47 @@ fn roundtrip_lead_with_default_value() -> Result<()> {
         true,
     )?))
 }
+
+/// Tests that `IGNORE NULLS` on a window function such as `lag` survives a
+/// protobuf round-trip. This is a regression test for a bug where the flag
+/// was always serialized as `false`, so the decoded plan no longer skipped
+/// NULLs.
+#[test]
+fn roundtrip_lag_ignore_nulls() -> Result<()> {
+    use datafusion::functions_window::lead_lag::lag_udwf;
+
+    let field_a = Field::new("a", DataType::Int64, true);
+    let field_b = Field::new("b", DataType::Int64, false);
+    let schema = Arc::new(Schema::new(vec![field_a, field_b]));
+
+    // lag(a) IGNORE NULLS
+    let lag_window = create_udwf_window_expr(
+        &lag_udwf(),
+        &[col("a", &schema)?],
+        schema.as_ref(),
+        "test lag ignore nulls".to_string(),
+        true,
+    )?;
+
+    let udwf_expr = Arc::new(StandardWindowExpr::new(
+        lag_window,
+        &[col("b", &schema)?],
+        &[PhysicalSortExpr {
+            expr: col("a", &schema)?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        }],
+        Arc::new(WindowFrame::new(None)),
+    ));
+
+    let input = Arc::new(EmptyExec::new(schema.clone()));
+
+    roundtrip_test(Arc::new(BoundedWindowAggExec::try_new(
+        vec![udwf_expr],
+        input,
+        InputOrderMode::Sorted,
+        true,
+    )?))
+}

@@ -67,7 +67,7 @@ pub(super) fn encode_physical_window_expr(
                         window_udf.fun().name().to_string(),
                     ),
                     ctx.encode_udwf(window_udf.fun().as_ref())?,
-                    false,
+                    window_udf.ignore_nulls(),
                     false,
                 )
             } else {
