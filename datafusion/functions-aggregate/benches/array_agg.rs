@@ -636,10 +636,83 @@ fn ordered_array_agg_wide_utf8_benchmark(c: &mut Criterion) {
     );
 }
 
+/// Benchmarks `evaluate` (also used by `state`) on an accumulator that already
+/// holds the distinct values of `values`.
+fn distinct_evaluate_bench(c: &mut Criterion, name: &str, values: &ArrayRef) {
+    let mut acc =
+        DistinctArrayAggAccumulator::try_new(values.data_type(), None, false).unwrap();
+    acc.update_batch(std::slice::from_ref(values)).unwrap();
+    c.bench_function(name, |b| b.iter(|| black_box(acc.evaluate().unwrap())));
+}
+
+/// Benchmarks merging a partial state of `num_rows` lists of `values_per_row`
+/// values each into an empty accumulator.
+fn distinct_merge_batch_bench(
+    c: &mut Criterion,
+    name: &str,
+    num_rows: usize,
+    values_per_row: usize,
+) {
+    let values =
+        create_string_array_high_cardinality(num_rows * values_per_row, 0.05, 0.0);
+    let state = Arc::new(ListArray::new(
+        Arc::new(Field::new_list_field(DataType::Utf8, true)),
+        OffsetBuffer::from_lengths(std::iter::repeat_n(values_per_row, num_rows)),
+        Arc::new(values),
+        None,
+    )) as ArrayRef;
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            DistinctArrayAggAccumulator::try_new(&DataType::Utf8, None, false)
+                .unwrap()
+                .merge_batch(std::slice::from_ref(&state))
+                .unwrap()
+        })
+    });
+}
+
+fn distinct_array_agg_evaluate_merge_benchmark(c: &mut Criterion) {
+    let values = Arc::new(create_string_array_low_cardinality(8192, 0.0)) as ArrayRef;
+    distinct_evaluate_bench(
+        c,
+        "distinct_array_agg evaluate utf8 low cardinality (~25 distinct)",
+        &values,
+    );
+
+    let values =
+        Arc::new(create_string_array_high_cardinality(8192, 0.05, 0.0)) as ArrayRef;
+    distinct_evaluate_bench(
+        c,
+        "distinct_array_agg evaluate utf8 high cardinality (~7800 distinct)",
+        &values,
+    );
+
+    let values = Arc::new(Int64Array::from_iter_values(0..8192)) as ArrayRef;
+    distinct_evaluate_bench(
+        c,
+        "distinct_array_agg evaluate int64 (8192 distinct)",
+        &values,
+    );
+
+    distinct_merge_batch_bench(
+        c,
+        "distinct_array_agg merge_batch utf8 1024 lists of 8",
+        1024,
+        8,
+    );
+    distinct_merge_batch_bench(
+        c,
+        "distinct_array_agg merge_batch utf8 8 lists of 1024",
+        8,
+        1024,
+    );
+}
+
 criterion_group!(
     benches,
     array_agg_benchmark,
     distinct_array_agg_benchmark,
+    distinct_array_agg_evaluate_merge_benchmark,
     distinct_array_agg_groups_benchmark,
     ordered_array_agg_benchmark,
     ordered_array_agg_wide_utf8_benchmark

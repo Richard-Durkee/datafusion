@@ -1445,14 +1445,22 @@ impl DistinctArrayAggAccumulator {
             .flatten();
         let mut metric_recorder = AggregateMetricRecorder::new(distinct_metric);
 
-        // The DISTINCT state is `List<value>`. This calls the update
-        // implementation once per state row, so record the submetric once for
-        // the entire merge rather than once per row.
-        {
-            let _timer = metric_recorder.timer();
-            states[0]
-                .as_list::<i32>()
-                .iter()
+        // The DISTINCT state is `List<value>`. Record the submetric once for
+        // the entire merge rather than once per state row.
+        let _timer = metric_recorder.timer();
+        let list = states[0].as_list::<i32>();
+        if list.null_count() == 0 {
+            // Every list is valid, so their values are one contiguous run of
+            // the child array and can be deduplicated in a single pass.
+            let offsets = list.value_offsets();
+            let start = offsets[0] as usize;
+            let end = offsets[list.len()] as usize;
+            let values = list.values().slice(start, end - start);
+            self.update_batch_impl(&[values], false)
+        } else {
+            // A null list may still cover child values, so visit only the
+            // valid lists.
+            list.iter()
                 .flatten()
                 .try_for_each(|val| self.update_batch_impl(&[val], false))
         }
@@ -1518,25 +1526,15 @@ impl Accumulator for DistinctArrayAggAccumulator {
             live_indices.iter().map(|&i| group_rows[i].row()).collect();
         let arrays = converter.convert_rows(rows)?;
 
-        // `convert_rows` always returns the physical (non-dictionary) type.
-        // Cast back to the declared logical type when they differ AND the
-        // declared type contains a Dictionary somewhere (directly or nested
-        // inside a Struct, List, etc.) — that is the only case where
-        // RowConverter strips the logical type.
-        let decoded = if arrays[0].data_type() != &self.datatype
-            && datatype_contains_dictionary(&self.datatype)
-        {
+        // `convert_rows` always returns the physical (non-dictionary) type, so
+        // cast back to the declared type when they differ.
+        let decoded = if arrays[0].data_type() != &self.datatype {
             cast(arrays[0].as_ref(), &self.datatype)?
         } else {
             Arc::clone(&arrays[0])
         };
 
-        let values: Vec<ScalarValue> = (0..decoded.len())
-            .map(|i| ScalarValue::try_from_array(decoded.as_ref(), i))
-            .collect::<Result<_>>()?;
-
-        let arr = ScalarValue::new_list(&values, &self.datatype, true);
-        Ok(ScalarValue::List(arr))
+        Ok(SingleRowListArrayBuilder::new(decoded).build_list_scalar())
     }
 
     fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
@@ -4904,6 +4902,77 @@ mod tests {
         values.sort_unstable();
 
         assert_eq!(values, vec!["duckdb", "mysql", "postgres", "redis"]);
+        Ok(())
+    }
+
+    /// Merges `state` into an empty sorted DISTINCT accumulator and returns
+    /// the resulting values.
+    fn distinct_merge_sorted(state: ListArray) -> Result<Vec<Option<i32>>> {
+        let mut acc = DistinctArrayAggAccumulator::try_new(
+            &DataType::Int32,
+            Some(SortOptions::default()),
+            false,
+        )?;
+        acc.merge_batch(&[Arc::new(state)])?;
+        let ScalarValue::List(arr) = acc.evaluate()? else {
+            return internal_err!("expected a list");
+        };
+        Ok(arr.value(0).as_primitive::<Int32Type>().iter().collect())
+    }
+
+    fn int32_list_state(
+        lengths: &[usize],
+        values: Vec<Option<i32>>,
+        nulls: Option<NullBuffer>,
+    ) -> ListArray {
+        ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Int32, true)),
+            OffsetBuffer::from_lengths(lengths.iter().copied()),
+            Arc::new(Int32Array::from(values)),
+            nulls,
+        )
+    }
+
+    #[test]
+    fn distinct_array_agg_merges_all_state_rows() -> Result<()> {
+        let state = int32_list_state(
+            &[2, 0, 3, 1],
+            vec![Some(3), Some(1), Some(1), None, Some(2), Some(3)],
+            None,
+        );
+        assert_eq!(
+            distinct_merge_sorted(state)?,
+            vec![None, Some(1), Some(2), Some(3)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_array_agg_merge_skips_values_under_null_lists() -> Result<()> {
+        // The null list still covers child values 98 and 99.
+        let state = int32_list_state(
+            &[2, 2, 2],
+            vec![Some(1), Some(2), Some(99), Some(98), Some(3), Some(1)],
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        assert_eq!(
+            distinct_merge_sorted(state)?,
+            vec![Some(1), Some(2), Some(3)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_array_agg_merges_sliced_state() -> Result<()> {
+        let state = int32_list_state(
+            &[2, 1, 2, 1],
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)],
+            None,
+        );
+        assert_eq!(
+            distinct_merge_sorted(state.slice(1, 2))?,
+            vec![Some(3), Some(4), Some(5)]
+        );
         Ok(())
     }
 
