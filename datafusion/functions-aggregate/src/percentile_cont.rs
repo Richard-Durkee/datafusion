@@ -700,20 +700,22 @@ where
         }
 
         let input_group_values = values[0].as_list::<i32>();
+        let offsets = input_group_values.value_offsets();
+        let flat_values = input_group_values.values().as_primitive::<T>().values();
 
         // Ensure group values big enough
         self.group_values.resize(total_num_groups, Vec::new());
 
-        // Extend values to related groups
-        group_indices
-            .iter()
-            .zip(input_group_values.iter())
-            .for_each(|(&group_index, values_opt)| {
-                if let Some(values) = values_opt {
-                    let values = values.as_primitive::<T>();
-                    self.group_values[group_index].extend(values.values().iter());
-                }
-            });
+        // Extend values to related groups. Read each row's span straight from
+        // the flat values buffer instead of slicing out a new array per row.
+        for (row_idx, &group_index) in group_indices.iter().enumerate() {
+            if input_group_values.is_null(row_idx) {
+                continue;
+            }
+            let start = offsets[row_idx] as usize;
+            let end = offsets[row_idx + 1] as usize;
+            self.group_values[group_index].extend_from_slice(&flat_values[start..end]);
+        }
 
         Ok(())
     }
@@ -1284,6 +1286,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(dense_acc.all_values, sparse_acc.all_values);
+    }
+
+    #[test]
+    fn groups_merge_batch_skips_null_rows_and_respects_offsets() {
+        let mut acc =
+            PercentileContGroupsAccumulator::<Float64Type, FloatInterpolator>::new(
+                PercentileParam {
+                    aggregate_fn_name: "PERCENTILE_CONT".to_string(),
+                    state: PercentileParamState::Resolved(0.5),
+                    is_desc: false,
+                },
+                DataType::Float64,
+            );
+
+        // Rows: [9.0] | [1.0, 2.0] | null | [3.0] | [4.0, 5.0, 6.0].
+        // Slicing off the first row makes the list offsets start above zero.
+        let list = ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+            Some(vec![Some(9.0)]),
+            Some(vec![Some(1.0), Some(2.0)]),
+            None,
+            Some(vec![Some(3.0)]),
+            Some(vec![Some(4.0), Some(5.0), Some(6.0)]),
+        ]);
+        let state: ArrayRef = Arc::new(list.slice(1, 4));
+
+        acc.merge_batch(&[state], &[0, 1, 0, 1], 2).unwrap();
+
+        assert_eq!(
+            acc.group_values,
+            vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]]
+        );
     }
 
     #[test]
