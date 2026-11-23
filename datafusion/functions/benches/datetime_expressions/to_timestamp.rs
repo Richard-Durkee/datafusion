@@ -290,6 +290,58 @@ fn criterion_benchmark(c: &mut Criterion) {
             )
         })
     });
+
+    // The common SQL shape: literal formats, tried in order for each value.
+    let timestamps = StringArray::from_iter_values((0..8192).map(|i| {
+        format!(
+            "2024-{:02}-{:02} {:02}:{:02}:{:02}",
+            i % 12 + 1,
+            i % 28 + 1,
+            i % 24,
+            i % 60,
+            (i * 7) % 60
+        )
+    }));
+    let timestamps = ColumnarValue::Array(Arc::new(timestamps) as ArrayRef);
+    for (name, formats) in [
+        (
+            "to_timestamp_with_scalar_format_utf8",
+            vec!["%Y-%m-%d %H:%M:%S"],
+        ),
+        (
+            "to_timestamp_with_scalar_formats_first_fails_utf8",
+            vec!["%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S"],
+        ),
+    ] {
+        let mut args = vec![timestamps.clone()];
+        args.extend(formats.into_iter().map(|f| {
+            ColumnarValue::Scalar(datafusion_common::ScalarValue::Utf8(Some(
+                f.to_string(),
+            )))
+        }));
+        let arg_fields = args
+            .iter()
+            .enumerate()
+            .map(|(idx, arg)| {
+                Field::new(format!("arg_{idx}"), arg.data_type(), true).into()
+            })
+            .collect::<Vec<_>>();
+        c.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(
+                    to_timestamp_udf
+                        .invoke_with_args(ScalarFunctionArgs {
+                            args: args.clone(),
+                            arg_fields: arg_fields.clone(),
+                            number_rows: 8192,
+                            return_field: Arc::clone(&return_field),
+                            config_options: Arc::clone(&config_options),
+                        })
+                        .expect("to_timestamp should work on valid values"),
+                )
+            })
+        });
+    }
 }
 
 criterion_group!(benches, criterion_benchmark);

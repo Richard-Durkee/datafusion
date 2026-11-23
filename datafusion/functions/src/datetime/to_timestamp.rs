@@ -885,9 +885,7 @@ fn to_timestamp_impl<T: ArrowTimestampType + ScalarType<i64>>(
         ),
         n if n >= 2 => handle_multiple::<T, _, _>(
             args,
-            move |s, format| {
-                string_to_timestamp_nanos_formatted_with_timezone(tz.as_ref(), s, format)
-            },
+            move |s, format| string_to_timestamp_nanos_compiled(tz.as_ref(), s, format),
             |n| n / factor,
             name,
             &Timestamp(T::UNIT, timezone.cloned()),
@@ -1543,6 +1541,52 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn to_timestamp_with_changing_and_fallback_formats() -> Result<()> {
+        let dates: ArrayRef = Arc::new(StringArray::from(vec![
+            "2020-09-08 13:42:29",
+            "2020-09-08 13:42:30",
+            "08/09/2020 13:42",
+            "2020-09-08 13:42:31",
+        ]));
+        let expected = TimestampNanosecondArray::from(vec![
+            1599572549000000000,
+            1599572550000000000,
+            1599572520000000000,
+            1599572551000000000,
+        ])
+        .with_timezone("UTC");
+
+        // A format column whose value changes from row to row.
+        let formats: ArrayRef = Arc::new(StringArray::from(vec![
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%d/%m/%Y %H:%M",
+            "%Y-%m-%d %H:%M:%S",
+        ]));
+        let ColumnarValue::Array(parsed) = to_timestamp(&[
+            ColumnarValue::Array(Arc::clone(&dates)),
+            ColumnarValue::Array(formats),
+        ])?
+        else {
+            panic!("Expected a columnar array")
+        };
+        assert_eq!(&expected as &dyn Array, parsed.as_ref());
+
+        // Literal formats, tried in order, skipping a null one.
+        let ColumnarValue::Array(parsed) = to_timestamp(&[
+            ColumnarValue::Array(dates),
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("%d/%m/%Y %H:%M".into()))),
+            ColumnarValue::Scalar(ScalarValue::Utf8(None)),
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("%Y-%m-%d %H:%M:%S".into()))),
+        ])?
+        else {
+            panic!("Expected a columnar array")
+        };
+        assert_eq!(&expected as &dyn Array, parsed.as_ref());
         Ok(())
     }
 

@@ -86,11 +86,11 @@ impl ToDateFunc {
             2.. => handle_multiple::<Date32Type, _, _>(
                 args,
                 |s, format| {
-                    string_to_timestamp_millis_formatted(s, format)
+                    string_to_timestamp_millis_compiled(s, format)
                         .map(|n| n.div_euclid(24 * 60 * 60 * 1_000))
                         .and_then(|v| {
                             v.try_into().map_err(|_| {
-                                internal_datafusion_err!("Unable to cast to Date32 for converting from i64 to i32 failed")
+                                FormatError::Other(internal_datafusion_err!("Unable to cast to Date32 for converting from i64 to i32 failed"))
                             })
                         })
                 },

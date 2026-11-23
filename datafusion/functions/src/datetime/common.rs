@@ -14,7 +14,7 @@ use arrow::compute::kernels::cast_utils::string_to_datetime;
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow_buffer::ArrowNativeType;
 use chrono::LocalResult::Single;
-use chrono::format::{Parsed, StrftimeItems, parse};
+use chrono::format::{Item, ParseError, Parsed, StrftimeItems, parse};
 use chrono::{DateTime, TimeZone, Utc};
 use datafusion_common::cast::as_generic_string_array;
 use datafusion_common::{
@@ -79,6 +79,74 @@ pub(crate) fn validate_data_types(args: &[ColumnarValue], name: &str) -> Result<
     Ok(())
 }
 
+/// A [`chrono::format::strftime`] format whose items are parsed once, so that
+/// it can be applied to many values.
+///
+/// [`chrono::format::strftime`]: https://docs.rs/chrono/latest/chrono/format/strftime/index.html
+pub(crate) struct CompiledFormat<'a> {
+    /// The format as written.
+    source: &'a str,
+    /// The items of `source`, without a trailing ` %Z`.
+    items: Vec<Item<'a>>,
+    /// The items of all of `source` when it ends with ` %Z`. A value with no
+    /// space to split a time zone name from is parsed with these.
+    items_with_tz_name: Option<Vec<Item<'a>>>,
+    /// `%Z` appears somewhere other than at the end after a space.
+    unsupported_tz_name: bool,
+}
+
+impl<'a> CompiledFormat<'a> {
+    pub(crate) fn new(source: &'a str) -> Self {
+        // Manually handle the most common case of a named timezone at the end of the timestamp.
+        // Note that %+ handles 'Z' at the end of the string without a space. This code doesn't
+        // handle named timezones with no preceding space since that would require writing a
+        // custom parser (or switching to Jiff)
+        if source.trim_end().ends_with(" %Z") {
+            Self {
+                source,
+                items: StrftimeItems::new(&source[..source.len() - 3]).collect(),
+                items_with_tz_name: Some(StrftimeItems::new(source).collect()),
+                unsupported_tz_name: false,
+            }
+        } else {
+            Self {
+                source,
+                items: StrftimeItems::new(source).collect(),
+                items_with_tz_name: None,
+                unsupported_tz_name: source.contains("%Z"),
+            }
+        }
+    }
+}
+
+/// Why a value could not be parsed with a [`CompiledFormat`].
+///
+/// When several formats are tried, only the error of the last one is returned,
+/// so the message is built by [`FormatError::into_error`] once no format matched.
+pub(crate) enum FormatError {
+    Chrono(ParseError),
+    TzName(chrono_tz::ParseError),
+    UnsupportedTzName,
+    Other(DataFusionError),
+}
+
+impl FormatError {
+    pub(crate) fn into_error(self, value: &str, format: &str) -> DataFusionError {
+        let context = match self {
+            FormatError::Chrono(e) => e.to_string(),
+            FormatError::TzName(e) => e.to_string(),
+            FormatError::UnsupportedTzName => {
+                "'%Z' is only supported at the end of the format string preceded by a space"
+                    .to_string()
+            }
+            FormatError::Other(e) => return e,
+        };
+        exec_datafusion_err!(
+            "Error parsing timestamp from '{value}' using format '{format}': {context}"
+        )
+    }
+}
+
 /// Accepts a string and parses it using the [`chrono::format::strftime`] specifiers
 /// relative to the provided `timezone`
 ///
@@ -90,83 +158,71 @@ pub(crate) fn validate_data_types(args: &[ColumnarValue], name: &str) -> Result<
 ///
 /// [`chrono::format::strftime`]: https://docs.rs/chrono/latest/chrono/format/strftime/index.html
 /// [IANA timezones]: https://www.iana.org/time-zones
+#[cfg(test)]
 pub(crate) fn string_to_datetime_formatted<T: TimeZone>(
     timezone: &T,
     s: &str,
     format: &str,
 ) -> Result<DateTime<T>, DataFusionError> {
-    let err = |err_ctx: &str| {
-        exec_datafusion_err!(
-            "Error parsing timestamp from '{s}' using format '{format}': {err_ctx}"
-        )
-    };
+    string_to_datetime_compiled(timezone, s, &CompiledFormat::new(format))
+        .map_err(|e| e.into_error(s, format))
+}
+
+/// Like [`string_to_datetime_formatted`], with a format that is already parsed.
+pub(crate) fn string_to_datetime_compiled<T: TimeZone>(
+    timezone: &T,
+    s: &str,
+    format: &CompiledFormat<'_>,
+) -> Result<DateTime<T>, FormatError> {
+    if format.unsupported_tz_name {
+        return Err(FormatError::UnsupportedTzName);
+    }
 
     let mut datetime_str = s;
-    let mut format = format;
-
-    // Manually handle the most common case of a named timezone at the end of the timestamp.
-    // Note that %+ handles 'Z' at the end of the string without a space. This code doesn't
-    // handle named timezones with no preceding space since that would require writing a
-    // custom parser (or switching to Jiff)
-    let tz: Option<chrono_tz::Tz> = if format.trim_end().ends_with(" %Z") {
-        // grab the string after the last space as the named timezone
-        if let Some((dt_str, timezone_name)) = datetime_str.trim_end().rsplit_once(' ') {
-            datetime_str = dt_str;
-
-            // attempt to parse the timezone name
-            let result: Result<chrono_tz::Tz, chrono_tz::ParseError> =
-                timezone_name.parse();
-            let Ok(tz) = result else {
-                return Err(err(&result.unwrap_err().to_string()));
-            };
-
-            // successfully parsed the timezone name, remove the ' %Z' from the format
-            format = &format[..format.len() - 3];
-
-            Some(tz)
-        } else {
-            None
+    let mut items = &format.items;
+    let tz: Option<chrono_tz::Tz> = match &format.items_with_tz_name {
+        Some(items_with_tz_name) => {
+            // grab the string after the last space as the named timezone
+            if let Some((dt_str, timezone_name)) =
+                datetime_str.trim_end().rsplit_once(' ')
+            {
+                datetime_str = dt_str;
+                Some(timezone_name.parse().map_err(FormatError::TzName)?)
+            } else {
+                items = items_with_tz_name;
+                None
+            }
         }
-    } else if format.contains("%Z") {
-        return Err(err(
-            "'%Z' is only supported at the end of the format string preceded by a space",
-        ));
-    } else {
-        None
+        None => None,
     };
 
     let mut parsed = Parsed::new();
-    parse(&mut parsed, datetime_str, StrftimeItems::new(format))
-        .map_err(|e| err(&e.to_string()))?;
+    parse(&mut parsed, datetime_str, items.iter()).map_err(FormatError::Chrono)?;
 
     let dt = match tz {
         Some(tz) => {
             // A timezone was manually parsed out, convert it to a fixed offset
-            match parsed.to_datetime_with_timezone(&tz) {
-                Ok(dt) => Ok(dt.fixed_offset()),
-                Err(e) => Err(e),
-            }
+            parsed
+                .to_datetime_with_timezone(&tz)
+                .map(|dt| dt.fixed_offset())
         }
         // default to parse the string assuming it has a timezone
         None => parsed.to_datetime(),
     };
 
-    if let Err(e) = &dt {
-        // no timezone or other failure, try without a timezone
-        let ndt = parsed
-            .to_naive_datetime_with_offset(0)
-            .or_else(|_| parsed.to_naive_date().map(|nd| nd.into()));
-        if let Err(e) = &ndt {
-            return Err(err(&e.to_string()));
+    match dt {
+        Ok(dt) => Ok(dt.with_timezone(timezone)),
+        Err(e) => {
+            // no timezone or other failure, try without a timezone
+            let ndt = parsed
+                .to_naive_datetime_with_offset(0)
+                .or_else(|_| parsed.to_naive_date().map(|nd| nd.into()))
+                .map_err(FormatError::Chrono)?;
+            match timezone.from_local_datetime(&ndt) {
+                Single(dt) => Ok(dt),
+                _ => Err(FormatError::Chrono(e)),
+            }
         }
-
-        if let Single(e) = &timezone.from_local_datetime(&ndt.unwrap()) {
-            Ok(e.to_owned())
-        } else {
-            Err(err(&e.to_string()))
-        }
-    } else {
-        Ok(dt.unwrap().with_timezone(timezone))
     }
 }
 
@@ -196,39 +252,42 @@ pub(crate) fn string_to_datetime_formatted<T: TimeZone>(
 /// defined by `chrono`.
 ///
 /// [`chrono::format::strftime`]: https://docs.rs/chrono/latest/chrono/format/strftime/index.html
-#[inline]
+#[cfg(test)]
 pub(crate) fn string_to_timestamp_nanos_formatted_with_timezone(
     timezone: Option<&Tz>,
     s: &str,
     format: &str,
 ) -> Result<i64, DataFusionError> {
-    let dt = string_to_datetime_formatted(timezone.unwrap_or(&UTC), s, format)?;
-    let parsed = dt
-        .timestamp_nanos_opt()
-        .ok_or_else(|| exec_datafusion_err!("{ERR_NANOSECONDS_NOT_SUPPORTED}"))?;
-
-    Ok(parsed)
+    string_to_timestamp_nanos_compiled(timezone, s, &CompiledFormat::new(format))
+        .map_err(|e| e.into_error(s, format))
 }
 
-/// Accepts a string with a `chrono` format and converts it to a
-/// millisecond precision timestamp relative to the provided `timezone`.
+/// Like [`string_to_timestamp_nanos_formatted_with_timezone`], with a format
+/// that is already parsed.
+#[inline]
+pub(crate) fn string_to_timestamp_nanos_compiled(
+    timezone: Option<&Tz>,
+    s: &str,
+    format: &CompiledFormat<'_>,
+) -> Result<i64, FormatError> {
+    let dt = string_to_datetime_compiled(timezone.unwrap_or(&UTC), s, format)?;
+    dt.timestamp_nanos_opt().ok_or_else(|| {
+        FormatError::Other(exec_datafusion_err!("{ERR_NANOSECONDS_NOT_SUPPORTED}"))
+    })
+}
+
+/// Accepts a string and a parsed `chrono` format and converts the string to a
+/// millisecond precision timestamp in UTC.
 ///
 /// See [`chrono::format::strftime`] for the full set of supported formats.
 ///
-/// Internally, this function uses the `chrono` library for the
-/// datetime parsing
-///
-/// ## Timezone / Offset Handling
-///
-/// Numerical values of timestamps are stored compared to offset UTC.
-///
-/// Any timestamp in the formatting string is handled according to the rules
-/// defined by `chrono`.
-///
 /// [`chrono::format::strftime`]: https://docs.rs/chrono/latest/chrono/format/strftime/index.html
 #[inline]
-pub(crate) fn string_to_timestamp_millis_formatted(s: &str, format: &str) -> Result<i64> {
-    Ok(string_to_datetime_formatted(&Utc, s, format)?
+pub(crate) fn string_to_timestamp_millis_compiled(
+    s: &str,
+    format: &CompiledFormat<'_>,
+) -> Result<i64, FormatError> {
+    Ok(string_to_datetime_compiled(&Utc, s, format)?
         .naive_utc()
         .and_utc()
         .timestamp_millis())
@@ -296,7 +355,7 @@ pub(crate) fn handle_multiple<O, F, M>(
 ) -> Result<ColumnarValue>
 where
     O: ArrowPrimitiveType,
-    F: Fn(&str, &str) -> Result<O::Native>,
+    F: Fn(&str, &CompiledFormat<'_>) -> Result<O::Native, FormatError>,
     M: Fn(O::Native) -> O::Native,
 {
     match &args[0] {
@@ -364,14 +423,14 @@ where
                     };
 
                     if let Some(s) = x {
-                        match op(a, s.as_str()) {
+                        match op(a, &CompiledFormat::new(s)) {
                             Ok(r) => {
                                 let result = op2(r).to_i64();
                                 let s = scalar_value(dt, result)?;
                                 ret = Some(Ok(ColumnarValue::Scalar(s)));
                                 break;
                             }
-                            Err(e) => ret = Some(Err(e)),
+                            Err(e) => ret = Some(Err(e.into_error(a, s))),
                         }
                     }
                 }
@@ -406,7 +465,7 @@ pub(crate) fn strings_to_primitive_function<O, F, F2>(
 ) -> Result<PrimitiveArray<O>>
 where
     O: ArrowPrimitiveType,
-    F: Fn(&str, &str) -> Result<O::Native>,
+    F: Fn(&str, &CompiledFormat<'_>) -> Result<O::Native, FormatError>,
     F2: Fn(O::Native) -> O::Native,
 {
     if args.len() < 2 {
@@ -467,50 +526,68 @@ fn handle_array_op<'a, O, V, F, F2>(
 where
     V: StringArrayType<'a>,
     O: ArrowPrimitiveType,
-    F: Fn(&str, &str) -> Result<O::Native>,
+    F: Fn(&str, &CompiledFormat<'_>) -> Result<O::Native, FormatError>,
     F2: Fn(O::Native) -> O::Native,
 {
+    // Literal formats are parsed once. A format column is parsed again only
+    // when its value differs from the previous row's.
+    let mut formats: Vec<Option<CompiledFormat<'_>>> = args
+        .iter()
+        .map(|arg| match arg {
+            ColumnarValue::Scalar(s) => s.try_as_str().flatten().map(CompiledFormat::new),
+            ColumnarValue::Array(_) => None,
+        })
+        .collect();
+
     first
         .iter()
         .enumerate()
         .map(|(pos, x)| {
-            let mut val = None;
-            if let Some(x) = x {
-                for arg in args {
-                    let v = match arg {
-                        ColumnarValue::Array(a) => {
-                            if a.is_null(pos) {
-                                continue;
-                            }
-                            match a.data_type() {
-                                DataType::Utf8View => Ok(a.as_string_view().value(pos)),
-                                DataType::LargeUtf8 => {
-                                    Ok(a.as_string::<i64>().value(pos))
-                                }
-                                DataType::Utf8 => Ok(a.as_string::<i32>().value(pos)),
-                                other => {
-                                    exec_err!("Unexpected type encountered '{other}'")
-                                }
-                            }
+            let Some(x) = x else {
+                return Ok(None);
+            };
+            let mut last_error = None;
+            for (arg, compiled) in args.iter().zip(formats.iter_mut()) {
+                let format: &CompiledFormat<'_> = match arg {
+                    ColumnarValue::Array(a) => {
+                        if a.is_null(pos) {
+                            continue;
                         }
-                        ColumnarValue::Scalar(s) => match s.try_as_str() {
-                            Some(Some(v)) => Ok(v),
-                            Some(None) => continue, // null string
-                            None => exec_err!("Unexpected scalar type encountered '{s}'"),
-                        },
-                    }?;
-
-                    let r = op(x, v);
-                    if let Ok(inner) = r {
-                        val = Some(Ok(op2(inner)));
-                        break;
-                    } else {
-                        val = Some(r);
+                        let v = match a.data_type() {
+                            DataType::Utf8View => a.as_string_view().value(pos),
+                            DataType::LargeUtf8 => a.as_string::<i64>().value(pos),
+                            DataType::Utf8 => a.as_string::<i32>().value(pos),
+                            other => {
+                                return exec_err!(
+                                    "Unexpected type encountered '{other}'"
+                                );
+                            }
+                        };
+                        if compiled.as_ref().is_none_or(|c| c.source != v) {
+                            *compiled = None;
+                        }
+                        compiled.get_or_insert_with(|| CompiledFormat::new(v))
                     }
+                    ColumnarValue::Scalar(s) => match compiled.as_ref() {
+                        Some(format) => format,
+                        // null string
+                        None if s.try_as_str().is_some() => continue,
+                        None => {
+                            return exec_err!("Unexpected scalar type encountered '{s}'");
+                        }
+                    },
+                };
+
+                match op(x, format) {
+                    Ok(value) => return Ok(Some(op2(value))),
+                    Err(e) => last_error = Some((e, format.source)),
                 }
             }
 
-            val.transpose()
+            match last_error {
+                Some((e, format)) => Err(e.into_error(x, format)),
+                None => Ok(None),
+            }
         })
         .collect()
 }
