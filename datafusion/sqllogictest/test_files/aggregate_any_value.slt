@@ -42,3 +42,57 @@ query I
 SELECT any_value(column2) FROM any_value_test WHERE column1 = 2;
 ----
 NULL
+
+# Grouped any_value skips NULLs in every group, for primitive, string and
+# nested values, and when the input arrives in several batches.
+statement ok
+CREATE TABLE any_value_groups AS
+SELECT
+  value % 4 AS g,
+  CASE WHEN value < 8 THEN NULL ELSE value % 4 END AS i,
+  CASE WHEN value < 8 THEN NULL ELSE 'v' || CAST(value % 4 AS VARCHAR) END AS s,
+  CASE WHEN value < 8 THEN NULL ELSE [value % 4] END AS l
+FROM generate_series(0, 99);
+
+statement ok
+SET datafusion.execution.batch_size = 3;
+
+query IIITI rowsort
+SELECT g, any_value(i), any_value(i) FILTER (WHERE i IS NULL), any_value(s), any_value(l)[1]
+FROM any_value_groups
+GROUP BY g;
+----
+0 0 NULL v0 0
+1 1 NULL v1 1
+2 2 NULL v2 2
+3 3 NULL v3 3
+
+# The same with partial aggregation skipped, which converts each input row to
+# a state on its own.
+statement ok
+SET datafusion.execution.skip_partial_aggregation_probe_rows_threshold = 1;
+
+statement ok
+SET datafusion.execution.skip_partial_aggregation_probe_ratio_threshold = 0.0;
+
+query IIT rowsort
+SELECT g, any_value(i), any_value(s)
+FROM any_value_groups
+GROUP BY g;
+----
+0 0 v0
+1 1 v1
+2 2 v2
+3 3 v3
+
+statement ok
+RESET datafusion.execution.skip_partial_aggregation_probe_rows_threshold;
+
+statement ok
+RESET datafusion.execution.skip_partial_aggregation_probe_ratio_threshold;
+
+statement ok
+RESET datafusion.execution.batch_size;
+
+statement ok
+DROP TABLE any_value_groups;

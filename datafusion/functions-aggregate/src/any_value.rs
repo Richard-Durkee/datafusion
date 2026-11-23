@@ -12,12 +12,14 @@ use datafusion_common::Result;
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::{AggregateOrderSensitivity, format_state_name};
 use datafusion_expr::{
-    Accumulator, AggregateUDFImpl, Documentation, Signature, Volatility,
-    udaf_return_field_preserving_arg_metadata,
+    Accumulator, AggregateUDFImpl, Documentation, GroupsAccumulator, Signature,
+    Volatility, udaf_return_field_preserving_arg_metadata,
 };
 use datafusion_macros::user_doc;
 
-use crate::first_last::TrivialFirstValueAccumulator;
+use crate::first_last::{
+    TrivialFirstValueAccumulator, create_groups_accumulator, groups_accumulator_supported,
+};
 
 make_udaf_expr_and_func!(
     AnyValue,
@@ -80,6 +82,25 @@ impl AggregateUDFImpl for AnyValue {
     fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
         TrivialFirstValueAccumulator::try_new(acc_args.return_field.data_type(), true)
             .map(|acc| Box::new(acc) as _)
+    }
+
+    fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
+        groups_accumulator_supported(&args)
+    }
+
+    fn create_groups_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
+        // `first_value` without an ordering, always skipping NULLs like
+        // `accumulator`. Its state is the value and an `is_set` flag, the
+        // same as `state_fields` below.
+        let args = AccumulatorArgs {
+            ignore_nulls: true,
+            order_bys: &[],
+            ..args
+        };
+        create_groups_accumulator(&args, true, false, self.name())
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {

@@ -122,7 +122,7 @@ fn create_groups_accumulator_helper<S: ValueState + 'static>(
     )?))
 }
 
-fn create_groups_accumulator(
+pub(crate) fn create_groups_accumulator(
     args: &AccumulatorArgs,
     is_first: bool,
     is_input_pre_ordered: bool,
@@ -227,7 +227,7 @@ fn create_groups_accumulator(
 ///
 /// `LAST_VALUE` also needs an ordering; `FIRST_VALUE` has a grouped
 /// accumulator with or without one.
-fn groups_accumulator_supported(args: &AccumulatorArgs) -> bool {
+pub(crate) fn groups_accumulator_supported(args: &AccumulatorArgs) -> bool {
     use DataType::*;
     matches!(
         args.return_field.data_type(),
