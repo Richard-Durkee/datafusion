@@ -1202,17 +1202,23 @@ impl BinaryExpr {
     ///
     /// When at most [`PRE_SELECTION_THRESHOLD`] of original rows remain,
     /// filters before conjuncts that may be costly or fail, so they never see
-    /// rows nested evaluation would skip. `NULL` rows stay for a later `false`.
+    /// rows nested evaluation would skip. Cheap conjuncts get the same
+    /// treatment below [`CHEAP_PRE_SELECTION_THRESHOLD`]. `NULL` rows stay for
+    /// a later `false`.
     fn evaluate_conjunction(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         // Keep each filter mask for the final scatter.
         let mut selections = vec![];
         let mut input = Cow::Borrowed(batch);
         let mut result = ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)));
+        let mut remaining = count_conjuncts(&self.left) + count_conjuncts(&self.right);
 
         // Returns whether to go on to the next conjunct.
         let mut evaluate = |conjunct: &Arc<dyn PhysicalExpr>| -> Result<bool> {
+            let conjuncts_left = remaining;
+            remaining -= 1;
             if let Some(undecided) = rows_to_filter_before(
                 conjunct,
+                conjuncts_left,
                 &result,
                 batch.schema_ref(),
                 batch.num_rows(),
@@ -1258,6 +1264,16 @@ enum ShortCircuitStrategy {
 
 /// Maximum share of rows still needing evaluation before filtering.
 const PRE_SELECTION_THRESHOLD: f32 = 0.2;
+
+/// Maximum share of rows still needing evaluation before filtering ahead of
+/// cheap conjuncts, per conjunct left in the chain. Filtering costs about the
+/// same as one cheap conjunct on all rows when roughly 1% of the rows are
+/// left, so the more cheap conjuncts follow, the more rows it may keep.
+const CHEAP_PRE_SELECTION_THRESHOLD: f32 = 0.01;
+
+/// Upper bound for the cheap threshold, however many conjuncts are left.
+/// Above it, scattered survivors make filtering cost more than it saves.
+const MAX_CHEAP_PRE_SELECTION_THRESHOLD: f32 = 0.03;
 
 /// Returns the short-circuit strategy for `OR` with a Boolean LHS.
 /// All true returns the LHS; all false returns the RHS. Sparse false rows
@@ -1424,11 +1440,15 @@ fn pre_selection_scatter(
     Ok(ColumnarValue::Array(Arc::new(boolean_result)))
 }
 
-/// Selects undecided rows when some are false, at most
-/// [`PRE_SELECTION_THRESHOLD`] of the original batch remain, and evaluating
-/// `conjunct` on all rows is not cheap and infallible.
+/// Selects undecided rows when some are false and few enough remain:
+/// at most [`PRE_SELECTION_THRESHOLD`] of the original batch when evaluating
+/// `conjunct` on all rows is not cheap and infallible, and at most
+/// [`CHEAP_PRE_SELECTION_THRESHOLD`] per conjunct left (`conjuncts_left`,
+/// counting `conjunct`), capped at [`MAX_CHEAP_PRE_SELECTION_THRESHOLD`],
+/// when it is.
 fn rows_to_filter_before(
     conjunct: &Arc<dyn PhysicalExpr>,
+    conjuncts_left: usize,
     result: &ColumnarValue,
     schema: &Schema,
     num_rows: usize,
@@ -1438,10 +1458,16 @@ fn rows_to_filter_before(
     };
     let undecided = not_false(array.as_boolean());
     let undecided_count = undecided.true_count();
+    if undecided_count == array.len() {
+        return None;
+    }
+    let fraction = undecided_count as f32 / num_rows as f32;
+    let cheap_threshold = (CHEAP_PRE_SELECTION_THRESHOLD * conjuncts_left as f32)
+        .min(MAX_CHEAP_PRE_SELECTION_THRESHOLD);
     // Classify last: it walks the whole conjunct.
-    (undecided_count < array.len()
-        && undecided_count as f32 / num_rows as f32 <= PRE_SELECTION_THRESHOLD
-        && !is_cheap_and_infallible(conjunct, schema))
+    (fraction <= cheap_threshold
+        || (fraction <= PRE_SELECTION_THRESHOLD
+            && !is_cheap_and_infallible(conjunct, schema)))
     .then_some(undecided)
 }
 
@@ -1500,6 +1526,16 @@ fn for_each_conjunct(
                 && for_each_conjunct(&binary.right, f)?)
         }
         _ => f(expr),
+    }
+}
+
+/// Counts the conjuncts of the `AND` chain under `expr`.
+fn count_conjuncts(expr: &Arc<dyn PhysicalExpr>) -> usize {
+    match expr.downcast_ref::<BinaryExpr>() {
+        Some(binary) if binary.op == Operator::And => {
+            count_conjuncts(&binary.left) + count_conjuncts(&binary.right)
+        }
+        _ => 1,
     }
 }
 
@@ -6920,20 +6956,57 @@ mod tests {
         // Filter before fallible work when few rows remain; keep NULLs.
         let expected = BooleanArray::from((0..10).map(|i| i < 2).collect::<Vec<_>>());
         assert_eq!(
-            rows_to_filter_before(&fallible, &few_left, &schema, 10),
+            rows_to_filter_before(&fallible, 1, &few_left, &schema, 10),
             Some(expected)
         );
-        assert_eq!(rows_to_filter_before(&cheap, &few_left, &schema, 10), None);
         assert_eq!(
-            rows_to_filter_before(&fallible, &many_left, &schema, 10),
+            rows_to_filter_before(&cheap, 1, &few_left, &schema, 10),
             None
         );
         assert_eq!(
-            rows_to_filter_before(&fallible, &all_true, &schema, 10),
+            rows_to_filter_before(&fallible, 1, &many_left, &schema, 10),
+            None
+        );
+        assert_eq!(
+            rows_to_filter_before(&fallible, 1, &all_true, &schema, 10),
             None
         );
         let scalar = ColumnarValue::Scalar(ScalarValue::Boolean(None));
-        assert_eq!(rows_to_filter_before(&fallible, &scalar, &schema, 10), None);
+        assert_eq!(
+            rows_to_filter_before(&fallible, 1, &scalar, &schema, 10),
+            None
+        );
+
+        // Cheap conjuncts: 1 undecided row out of 100 is 1%, which is within
+        // the threshold for one conjunct left. 3 out of 100 needs three.
+        let undecided = |n: usize| {
+            ColumnarValue::Array(Arc::new(BooleanArray::from(
+                (0..100).map(|i| Some(i < n)).collect::<Vec<_>>(),
+            )))
+        };
+        let mask =
+            |n: usize| BooleanArray::from((0..100).map(|i| i < n).collect::<Vec<_>>());
+        assert_eq!(
+            rows_to_filter_before(&cheap, 1, &undecided(1), &schema, 100),
+            Some(mask(1))
+        );
+        assert_eq!(
+            rows_to_filter_before(&cheap, 1, &undecided(2), &schema, 100),
+            None
+        );
+        assert_eq!(
+            rows_to_filter_before(&cheap, 2, &undecided(3), &schema, 100),
+            None
+        );
+        assert_eq!(
+            rows_to_filter_before(&cheap, 3, &undecided(3), &schema, 100),
+            Some(mask(3))
+        );
+        // The cap holds however many conjuncts are left.
+        assert_eq!(
+            rows_to_filter_before(&cheap, 10, &undecided(4), &schema, 100),
+            None
+        );
     }
 
     #[test]
