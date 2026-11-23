@@ -81,6 +81,7 @@ struct RuntimeConfigValues {
     memory_limit: Option<String>,
     max_temp_directory_size: Option<String>,
     max_spill_merge_fan_in: Option<String>,
+    uncached_spill_files: Option<String>,
     temp_directory: Option<String>,
     metadata_cache_limit: Option<String>,
     list_files_cache_limit: Option<String>,
@@ -99,6 +100,7 @@ impl RuntimeConfigValues {
             memory_limit,
             max_temp_directory_size,
             max_spill_merge_fan_in,
+            uncached_spill_files,
             temp_directory,
             metadata_cache_limit,
             list_files_cache_limit,
@@ -120,6 +122,11 @@ impl RuntimeConfigValues {
                 key: "datafusion.runtime.max_spill_merge_fan_in".to_string(),
                 value: max_spill_merge_fan_in,
                 description: "Maximum number of spill files opened by one external merge pass. Use 0 for unlimited. Values below 2 still use 2 so a merge can make progress.",
+            },
+            ConfigEntry {
+                key: "datafusion.runtime.uncached_spill_files".to_string(),
+                value: uncached_spill_files,
+                description: "When set to true, spill files are written and read with `RWF_DONTCACHE`, so they do not stay in the OS page cache. Needs Linux 6.14 or later on a filesystem that supports it, and falls back to normal I/O elsewhere.",
             },
             ConfigEntry {
                 key: "datafusion.runtime.temp_directory".to_string(),
@@ -277,6 +284,7 @@ impl RuntimeEnv {
         let max_temp_dir_value = format_byte_size(max_temp_dir_size);
         let max_spill_merge_fan_in =
             self.disk_manager.max_spill_merge_fan_in().to_string();
+        let uncached_spill_files = self.disk_manager.uncached_spill_files().to_string();
 
         let temp_paths = self.disk_manager.temp_dir_paths();
         let temp_dir_value = if temp_paths.is_empty() {
@@ -322,6 +330,7 @@ impl RuntimeEnv {
             memory_limit: memory_limit_value,
             max_temp_directory_size: Some(max_temp_dir_value),
             max_spill_merge_fan_in: Some(max_spill_merge_fan_in),
+            uncached_spill_files: Some(uncached_spill_files),
             temp_directory: temp_dir_value,
             metadata_cache_limit: Some(metadata_cache_value),
             list_files_cache_limit: Some(list_files_cache_value),
@@ -444,6 +453,14 @@ impl RuntimeEnvBuilder {
         self.with_disk_manager_builder(builder.with_max_spill_merge_fan_in(fan_in))
     }
 
+    /// Write and read spill files without keeping them in the OS page cache.
+    ///
+    /// See [`DiskManager::set_uncached_spill_files`].
+    pub fn with_uncached_spill_files(mut self, uncached: bool) -> Self {
+        let builder = self.disk_manager_builder.take().unwrap_or_default();
+        self.with_disk_manager_builder(builder.with_uncached_spill_files(uncached))
+    }
+
     /// Specify the limit of the file-embedded metadata cache, in bytes.
     pub fn with_metadata_cache_limit(mut self, limit: usize) -> Self {
         self.cache_manager = self.cache_manager.with_metadata_cache_limit(limit);
@@ -539,6 +556,7 @@ impl RuntimeEnvBuilder {
             memory_limit: None,
             max_temp_directory_size: Some("100G".to_string()),
             max_spill_merge_fan_in: Some("0".to_string()),
+            uncached_spill_files: Some("false".to_string()),
             temp_directory: None,
             metadata_cache_limit: Some("50M".to_owned()),
             list_files_cache_limit: Some("1M".to_owned()),

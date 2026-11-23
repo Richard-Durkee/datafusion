@@ -1276,6 +1276,14 @@ impl SessionContext {
                 })?;
                 builder.with_max_spill_merge_fan_in(fan_in)
             }
+            "uncached_spill_files" => {
+                let uncached = value.parse::<bool>().map_err(|e| {
+                    DataFusionError::Plan(format!(
+                        "Failed to parse boolean from '{variable}', value '{value}': {e}"
+                    ))
+                })?;
+                builder.with_uncached_spill_files(uncached)
+            }
             _ => return plan_err!("Unknown runtime configuration: {variable}"),
             // Remember to update `reset_runtime_variable()` when adding new options
         };
@@ -1323,6 +1331,9 @@ impl SessionContext {
             "max_spill_merge_fan_in" => {
                 builder =
                     builder.with_max_spill_merge_fan_in(DEFAULT_MAX_SPILL_MERGE_FAN_IN);
+            }
+            "uncached_spill_files" => {
+                builder = builder.with_uncached_spill_files(false);
             }
             _ => return plan_err!("Unknown runtime configuration: {variable}"),
         }

@@ -2180,6 +2180,7 @@ dependencies = [
  "datafusion-physical-expr-common",
  "futures",
  "insta",
+ "libc",
  "log",
  "object_store",
  "parking_lot 0.13.0",

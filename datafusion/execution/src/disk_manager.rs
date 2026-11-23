@@ -16,7 +16,7 @@ use rand::{Rng, rng};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tempfile::{Builder, TempDir, TempPath};
 pub const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 pub const DEFAULT_MAX_SPILL_MERGE_FAN_IN: usize = 0;
@@ -32,6 +32,8 @@ pub struct DiskManagerBuilder {
     /// Maximum number of spill files opened by one external merge pass.
     /// A value of 0 means unlimited.
     max_spill_merge_fan_in: usize,
+    /// Whether spill files bypass the OS page cache
+    uncached_spill_files: bool,
 }
 impl Debug for DiskManagerBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -47,6 +49,7 @@ impl Default for DiskManagerBuilder {
             mode: DiskManagerMode::OsTmpDirectory,
             max_temp_directory_size: DEFAULT_MAX_TEMP_DIRECTORY_SIZE,
             max_spill_merge_fan_in: DEFAULT_MAX_SPILL_MERGE_FAN_IN,
+            uncached_spill_files: false,
         }
     }
 }
@@ -99,6 +102,17 @@ impl DiskManagerBuilder {
         self
     }
 
+    /// See [`DiskManager::set_uncached_spill_files`].
+    pub fn set_uncached_spill_files(&mut self, value: bool) {
+        self.uncached_spill_files = value;
+    }
+
+    /// See [`DiskManager::set_uncached_spill_files`].
+    pub fn with_uncached_spill_files(mut self, value: bool) -> Self {
+        self.set_uncached_spill_files(value);
+        self
+    }
+
     /// Create a DiskManager given the builder
     pub fn build(self) -> Result<DiskManager> {
         match self.mode {
@@ -107,6 +121,7 @@ impl DiskManagerBuilder {
                 conf_dirs: vec![],
                 max_temp_directory_size: AtomicU64::new(self.max_temp_directory_size),
                 max_spill_merge_fan_in: AtomicUsize::new(self.max_spill_merge_fan_in),
+                uncached_spill_files: AtomicBool::new(self.uncached_spill_files),
                 used_disk_space: Arc::new(AtomicU64::new(0)),
                 active_files_count: Arc::new(AtomicUsize::new(0)),
                 factory: None,
@@ -119,6 +134,7 @@ impl DiskManagerBuilder {
                 conf_dirs,
                 max_temp_directory_size: AtomicU64::new(self.max_temp_directory_size),
                 max_spill_merge_fan_in: AtomicUsize::new(self.max_spill_merge_fan_in),
+                uncached_spill_files: AtomicBool::new(self.uncached_spill_files),
                 used_disk_space: Arc::new(AtomicU64::new(0)),
                 active_files_count: Arc::new(AtomicUsize::new(0)),
                 factory: None,
@@ -128,6 +144,7 @@ impl DiskManagerBuilder {
                 conf_dirs: vec![],
                 max_temp_directory_size: AtomicU64::new(self.max_temp_directory_size),
                 max_spill_merge_fan_in: AtomicUsize::new(self.max_spill_merge_fan_in),
+                uncached_spill_files: AtomicBool::new(self.uncached_spill_files),
                 used_disk_space: Arc::new(AtomicU64::new(0)),
                 active_files_count: Arc::new(AtomicUsize::new(0)),
                 factory: None,
@@ -137,6 +154,7 @@ impl DiskManagerBuilder {
                 conf_dirs: vec![],
                 max_temp_directory_size: AtomicU64::new(self.max_temp_directory_size),
                 max_spill_merge_fan_in: AtomicUsize::new(self.max_spill_merge_fan_in),
+                uncached_spill_files: AtomicBool::new(self.uncached_spill_files),
                 used_disk_space: Arc::new(AtomicU64::new(0)),
                 active_files_count: Arc::new(AtomicUsize::new(0)),
                 factory: Some(factory),
@@ -194,6 +212,8 @@ pub struct DiskManager {
     /// Maximum number of spill files opened by one external merge pass.
     /// A value of 0 preserves the memory-driven, unbounded behavior.
     max_spill_merge_fan_in: AtomicUsize,
+    /// Whether spill files bypass the OS page cache
+    uncached_spill_files: AtomicBool,
     /// Used disk space in the temporary directories. Now only spilled data for
     /// external executors are counted.
     used_disk_space: Arc<AtomicU64>,
@@ -297,6 +317,28 @@ impl DiskManager {
     /// A value of 0 means unlimited.
     pub fn max_spill_merge_fan_in(&self) -> usize {
         self.max_spill_merge_fan_in.load(Ordering::Relaxed)
+    }
+
+    /// Set whether local spill files are written and read without keeping
+    /// them in the OS page cache.
+    ///
+    /// A spill file is written once and read back once, while memory is short.
+    /// Through the page cache, its pages compete with the query's own memory
+    /// and the kernel has to reclaim them. When enabled, spill I/O uses
+    /// `RWF_DONTCACHE`, which drops the pages once they are on disk.
+    ///
+    /// This needs Linux 6.14 or later on a filesystem that supports it. On
+    /// other systems and filesystems spill files use normal I/O. Applies to
+    /// files opened after the call, and has no effect with a custom
+    /// [`TempFileFactory`].
+    pub fn set_uncached_spill_files(&self, uncached_spill_files: bool) {
+        self.uncached_spill_files
+            .store(uncached_spill_files, Ordering::Relaxed);
+    }
+
+    /// Returns whether local spill files bypass the OS page cache.
+    pub fn uncached_spill_files(&self) -> bool {
+        self.uncached_spill_files.load(Ordering::Relaxed)
     }
 
     /// Returns the current spilling progress
@@ -474,6 +516,8 @@ pub struct FileSpillWriter {
     file: std::fs::File,
     disk_manager: Arc<DiskManager>,
     current_file_disk_usage: Arc<AtomicU64>,
+    #[cfg(target_os = "linux")]
+    uncached: Option<uncached::WriteBuffer>,
 }
 
 impl std::io::Write for FileSpillWriter {
@@ -503,6 +547,13 @@ impl std::io::Write for FileSpillWriter {
             )));
         }
 
+        #[cfg(target_os = "linux")]
+        if let Some(uncached) = self.uncached.as_mut() {
+            uncached.write(&self.file, buf)?;
+        } else {
+            self.file.write_all(buf).map_err(DataFusionError::IoError)?;
+        }
+        #[cfg(not(target_os = "linux"))]
         self.file.write_all(buf).map_err(DataFusionError::IoError)?;
 
         self.current_file_disk_usage
@@ -512,7 +563,24 @@ impl std::io::Write for FileSpillWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(uncached) = self.uncached.as_mut() {
+            uncached.flush(&self.file)?;
+        }
         self.file.flush()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FileSpillWriter {
+    fn drop(&mut self) {
+        // Every write used to reach the file before returning. Keep that true
+        // for bytes still buffered by a writer that is dropped without a flush.
+        if let Some(uncached) = self.uncached.as_mut()
+            && let Err(e) = uncached.flush(&self.file)
+        {
+            debug!("Failed to flush spill file on drop: {e}");
+        }
     }
 }
 
@@ -520,6 +588,205 @@ impl SpillWriter for FileSpillWriter {
     fn finish(&mut self) -> Result<()> {
         // flush() is handled by Arrow, nothing left to do here
         Ok(())
+    }
+}
+
+/// Spill file I/O with `RWF_DONTCACHE`, see [`DiskManager::set_uncached_spill_files`].
+#[cfg(target_os = "linux")]
+mod uncached {
+    use bytes::Bytes;
+    use datafusion_common::{DataFusionError, Result};
+    use futures::Stream;
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+
+    const PAGE_SIZE: usize = 4096;
+    const CHUNK_SIZE: usize = 1024 * 1024;
+
+    /// Errors that mean the kernel or filesystem cannot do uncached I/O, after
+    /// which the file falls back to normal I/O.
+    fn is_unsupported(error: &std::io::Error) -> bool {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS)
+        )
+    }
+
+    /// Collects appends so that each uncached write ends on a page boundary.
+    /// An uncached write that ends inside a page drops that page, and the next
+    /// append would have to read it back from disk.
+    pub(super) struct WriteBuffer {
+        buffer: Vec<u8>,
+        /// File offset of the first byte in `buffer`
+        offset: u64,
+        supported: bool,
+    }
+
+    impl WriteBuffer {
+        pub(super) fn new(file: &File) -> std::io::Result<Self> {
+            Ok(Self {
+                buffer: Vec::with_capacity(CHUNK_SIZE),
+                offset: file.metadata()?.len(),
+                supported: true,
+            })
+        }
+
+        pub(super) fn write(
+            &mut self,
+            file: &File,
+            mut data: &[u8],
+        ) -> std::io::Result<()> {
+            while !data.is_empty() {
+                let take = (CHUNK_SIZE - self.buffer.len()).min(data.len());
+                self.buffer.extend_from_slice(&data[..take]);
+                data = &data[take..];
+                if self.buffer.len() == CHUNK_SIZE {
+                    self.write_to_page_boundary(file)?;
+                }
+            }
+            Ok(())
+        }
+
+        /// Writes out the whole buffer. The part after the last page boundary
+        /// goes through the page cache, so the next append finds that page
+        /// there instead of reading it from disk.
+        pub(super) fn flush(&mut self, file: &File) -> std::io::Result<()> {
+            self.write_to_page_boundary(file)?;
+            let mut file = file;
+            file.write_all(&self.buffer)?;
+            self.offset += self.buffer.len() as u64;
+            self.buffer.clear();
+            Ok(())
+        }
+
+        fn write_to_page_boundary(&mut self, file: &File) -> std::io::Result<()> {
+            let end = self.offset + self.buffer.len() as u64;
+            let tail = (end % PAGE_SIZE as u64) as usize;
+            let len = self.buffer.len().saturating_sub(tail);
+            let mut written = 0;
+            while written < len {
+                let chunk = &self.buffer[written..len];
+                if !self.supported {
+                    let mut file = file;
+                    file.write_all(chunk)?;
+                    break;
+                }
+                let iov = libc::iovec {
+                    iov_base: chunk.as_ptr().cast_mut().cast::<libc::c_void>(),
+                    iov_len: chunk.len(),
+                };
+                // SAFETY: `iov` points into `self.buffer`, which outlives the
+                // call. Offset -1 writes at the file position, which for a file
+                // opened in append mode is the end of the file.
+                let n = unsafe {
+                    libc::pwritev2(
+                        file.as_raw_fd(),
+                        &raw const iov,
+                        1,
+                        -1,
+                        libc::RWF_DONTCACHE,
+                    )
+                };
+                if n >= 0 {
+                    written += n as usize;
+                    continue;
+                }
+                let error = std::io::Error::last_os_error();
+                if is_unsupported(&error) {
+                    self.supported = false;
+                } else if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            self.buffer.drain(..len);
+            self.offset += len as u64;
+            Ok(())
+        }
+    }
+
+    struct ReadState {
+        path: PathBuf,
+        file: Option<File>,
+        offset: u64,
+        supported: bool,
+    }
+
+    /// Reads the next chunk, or returns `None` at the end of the file.
+    fn read_chunk(state: &mut ReadState) -> std::io::Result<Option<Bytes>> {
+        let file = match &state.file {
+            Some(file) => file,
+            None => state.file.insert(File::open(&state.path)?),
+        };
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+        let n = loop {
+            if !state.supported {
+                match file.read_at(&mut buffer, state.offset) {
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => break result?,
+                }
+            }
+            let iov = libc::iovec {
+                iov_base: buffer.as_mut_ptr().cast::<libc::c_void>(),
+                iov_len: buffer.len(),
+            };
+            // SAFETY: `iov` points at `buffer`, which outlives the call.
+            let n = unsafe {
+                libc::preadv2(
+                    file.as_raw_fd(),
+                    &raw const iov,
+                    1,
+                    state.offset as libc::off_t,
+                    libc::RWF_DONTCACHE,
+                )
+            };
+            if n >= 0 {
+                break n as usize;
+            }
+            let error = std::io::Error::last_os_error();
+            if is_unsupported(&error) {
+                state.supported = false;
+            } else if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        buffer.truncate(n);
+        state.offset += n as u64;
+        Ok(Some(Bytes::from(buffer)))
+    }
+
+    /// Streams the file in chunks, reading one chunk per poll. It does not
+    /// read ahead: a spill pool reads files that are still being written, and
+    /// a read past the current end would end the stream early.
+    pub(super) fn read_stream(
+        path: PathBuf,
+    ) -> Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>> {
+        let state = ReadState {
+            path,
+            file: None,
+            offset: 0,
+            supported: true,
+        };
+        Box::pin(futures::stream::try_unfold(state, |mut state| async move {
+            // Dropping the stream detaches at most one read, which finishes on
+            // its own.
+            #[expect(clippy::disallowed_methods)]
+            let (state, chunk) = tokio::task::spawn_blocking(move || {
+                let chunk = read_chunk(&mut state);
+                (state, chunk)
+            })
+            .await
+            .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))?;
+            Ok(chunk
+                .map_err(DataFusionError::IoError)?
+                .map(|chunk| (chunk, state)))
+        }))
     }
 }
 
@@ -537,6 +804,11 @@ impl SpillFile for RefCountedTempFile {
     ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes>> + Send>>>
     {
         let path = self.path().to_owned();
+
+        #[cfg(target_os = "linux")]
+        if self.disk_manager.uncached_spill_files() {
+            return Ok(uncached::read_stream(path));
+        }
 
         let stream =
             futures::stream::once(async move {
@@ -580,10 +852,18 @@ impl SpillFile for RefCountedTempFile {
             .append(true)
             .open(&*self.tempfile)
             .map_err(DataFusionError::IoError)?;
+        #[cfg(target_os = "linux")]
+        let uncached = if self.disk_manager.uncached_spill_files() {
+            Some(uncached::WriteBuffer::new(&file).map_err(DataFusionError::IoError)?)
+        } else {
+            None
+        };
         Ok(Box::new(FileSpillWriter {
             file,
             disk_manager: Arc::clone(&self.disk_manager),
             current_file_disk_usage: Arc::clone(&self.current_file_disk_usage),
+            #[cfg(target_os = "linux")]
+            uncached,
         }))
     }
 }
@@ -803,6 +1083,86 @@ mod tests {
         drop(temp_file);
         assert!(!temp_file_path.exists());
 
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_bytes(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31) ^ seed)
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn read_all(file: &Arc<dyn SpillFile>) -> Result<Vec<u8>> {
+        use futures::TryStreamExt;
+        let chunks: Vec<Bytes> = file.read_stream()?.try_collect().await?;
+        Ok(chunks.concat())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_uncached_spill_file_round_trip() -> Result<()> {
+        let dm = Arc::new(
+            DiskManager::builder()
+                .with_uncached_spill_files(true)
+                .build()?,
+        );
+        let file = dm.create_tmp_file("uncached")?;
+        let mut expected = Vec::new();
+        {
+            let mut writer = file.open_writer()?;
+            // Lengths that end on, before and after page and buffer boundaries
+            for (i, len) in [1, 4095, 4097, 1 << 20, (1 << 20) + 3, 10, 3 << 20]
+                .into_iter()
+                .enumerate()
+            {
+                let data = test_bytes(len, i as u8);
+                writer.write_all(&data)?;
+                expected.extend_from_slice(&data);
+                if len == 10 {
+                    writer.flush()?;
+                }
+            }
+            // Dropped without a flush, so the buffered tail is written on drop
+        }
+        {
+            let mut writer = file.open_writer()?;
+            let data = test_bytes(5000, 99);
+            writer.write_all(&data)?;
+            writer.flush()?;
+            expected.extend_from_slice(&data);
+        }
+        assert_eq!(file.size(), Some(expected.len() as u64));
+        assert_eq!(dm.used_disk_space(), expected.len() as u64);
+        assert_eq!(read_all(&file).await?, expected);
+        Ok(())
+    }
+
+    /// A spill pool reads a file while it is still being written, so the
+    /// stream must not read past what has been flushed so far.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_uncached_spill_file_read_while_writing() -> Result<()> {
+        use futures::StreamExt;
+        let dm = Arc::new(
+            DiskManager::builder()
+                .with_uncached_spill_files(true)
+                .build()?,
+        );
+        let file = dm.create_tmp_file("uncached")?;
+        let mut writer = file.open_writer()?;
+
+        let first = test_bytes(5000, 1);
+        writer.write_all(&first)?;
+        writer.flush()?;
+        let mut stream = file.read_stream()?;
+        assert_eq!(stream.next().await.unwrap()?, first);
+
+        let second = test_bytes(7000, 2);
+        writer.write_all(&second)?;
+        writer.flush()?;
+        assert_eq!(stream.next().await.unwrap()?, second);
         Ok(())
     }
 

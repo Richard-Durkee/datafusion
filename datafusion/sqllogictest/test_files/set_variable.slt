@@ -628,6 +628,18 @@ datafusion.runtime.max_spill_merge_fan_in 16
 statement ok
 RESET datafusion.runtime.max_spill_merge_fan_in
 
+# Test SET and SHOW runtime.uncached_spill_files
+statement ok
+SET datafusion.runtime.uncached_spill_files = 'true'
+
+query TT
+SHOW datafusion.runtime.uncached_spill_files
+----
+datafusion.runtime.uncached_spill_files true
+
+statement ok
+RESET datafusion.runtime.uncached_spill_files
+
 # Test SET and SHOW runtime.file_statistics_cache_limit
 statement ok
 SET datafusion.runtime.file_statistics_cache_limit = '42M'
@@ -691,6 +703,7 @@ datafusion.runtime.max_temp_directory_size
 datafusion.runtime.memory_limit
 datafusion.runtime.metadata_cache_limit
 datafusion.runtime.temp_directory
+datafusion.runtime.uncached_spill_files
 
 statement error DataFusion error: Error during planning: Unsupported value Null
 SET datafusion.runtime.memory_limit = NULL

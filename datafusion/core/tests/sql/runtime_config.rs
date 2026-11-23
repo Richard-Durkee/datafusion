@@ -249,6 +249,35 @@ async fn test_max_spill_merge_fan_in_runtime_config() {
 }
 
 #[tokio::test]
+async fn test_uncached_spill_files_runtime_config() {
+    let ctx = SessionContext::new();
+    assert!(!ctx.runtime_env().disk_manager.uncached_spill_files());
+
+    ctx.sql("SET datafusion.runtime.uncached_spill_files = 'true'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert!(ctx.runtime_env().disk_manager.uncached_spill_files());
+
+    ctx.sql("RESET datafusion.runtime.uncached_spill_files")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert!(!ctx.runtime_env().disk_manager.uncached_spill_files());
+
+    let error = ctx
+        .sql("SET datafusion.runtime.uncached_spill_files = 'maybe'")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Failed to parse boolean"));
+}
+
+#[tokio::test]
 async fn test_test_metadata_cache_limit() {
     let ctx = SessionContext::new();
 
