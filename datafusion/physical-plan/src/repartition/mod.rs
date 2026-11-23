@@ -211,6 +211,22 @@ impl OutputChannel {
         }
     }
 
+    /// Like [`Self::coalesce`], but gives `batch` back instead of waiting if
+    /// another input task holds the shared coalescer lock.
+    fn try_coalesce(
+        &mut self,
+        batch: RecordBatch,
+        out: &mut Vec<RecordBatch>,
+    ) -> Result<Option<RecordBatch>> {
+        match &self.shared_coalescer {
+            Some(shared) => shared.try_push_and_drain(batch, out),
+            None => {
+                out.push(batch);
+                Ok(None)
+            }
+        }
+    }
+
     /// Send a single batch through the channel for `partition`, applying
     /// the memory reservation / spill-writer fallback. Removes the channel
     /// from `self.inner` if the receiver has hung up.
@@ -291,6 +307,23 @@ impl SharedCoalescer {
             out.push(b);
         }
         Ok(())
+    }
+
+    /// Like [`Self::push_and_drain`], but returns `batch` unchanged if the
+    /// lock is held by another input task.
+    fn try_push_and_drain(
+        &self,
+        batch: RecordBatch,
+        out: &mut Vec<RecordBatch>,
+    ) -> Result<Option<RecordBatch>> {
+        let Some(mut c) = self.inner.try_lock() else {
+            return Ok(Some(batch));
+        };
+        c.push_batch(batch)?;
+        while let Some(b) = c.next_completed_batch() {
+            out.push(b);
+        }
+        Ok(None)
     }
 
     /// Decrement the active-senders counter. If this caller was the last
@@ -2311,6 +2344,8 @@ impl RepartitionExec {
         // While there are still outputs to send to, keep pulling inputs
         let mut batches_until_yield = partitioner.num_partitions();
         let mut coalesced = Vec::new();
+        let mut parts = Vec::new();
+        let mut deferred = Vec::new();
         while !output_channels.is_empty() {
             // fetch the next batch
             let timer = metrics.fetch_time.timer();
@@ -2329,12 +2364,38 @@ impl RepartitionExec {
             }
 
             for res in partitioner.partition_iter(batch)? {
-                let (partition, batch) = res?;
-
-                let timer = metrics.send_time[partition].timer();
-                // if there is still a receiver, send to it
-                if let Some(output_channel) = output_channels.get_mut(&partition) {
-                    output_channel.coalesce(batch, &mut coalesced)?;
+                parts.push(res?);
+            }
+            // Every input task produces its sub-batches in output partition
+            // order, and all of them push into the same per-output shared
+            // coalescers. Start each task at a different output partition,
+            // and skip an output whose coalescer lock is held by another
+            // task, coming back to it in a later round. We only wait for a
+            // lock when a whole round made no progress.
+            if parts.len() > 1 {
+                let offset = input_partition % parts.len();
+                parts.rotate_left(offset);
+            }
+            let mut wait_for_lock = false;
+            while !parts.is_empty() {
+                let mut progressed = false;
+                for (partition, batch) in parts.drain(..) {
+                    let Some(output_channel) = output_channels.get_mut(&partition)
+                    else {
+                        continue;
+                    };
+                    let timer = metrics.send_time[partition].timer();
+                    if wait_for_lock {
+                        wait_for_lock = false;
+                        output_channel.coalesce(batch, &mut coalesced)?;
+                        progressed = true;
+                    } else if let Some(batch) =
+                        output_channel.try_coalesce(batch, &mut coalesced)?
+                    {
+                        deferred.push((partition, batch));
+                    } else {
+                        progressed = true;
+                    }
                     for batch in coalesced.drain(..) {
                         if output_channel.send(batch).await.is_err() {
                             // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
@@ -2343,8 +2404,10 @@ impl RepartitionExec {
                             break;
                         }
                     }
+                    timer.done();
                 }
-                timer.done();
+                std::mem::swap(&mut parts, &mut deferred);
+                wait_for_lock = !progressed;
             }
 
             // If the input stream is endless, we may spin forever and
