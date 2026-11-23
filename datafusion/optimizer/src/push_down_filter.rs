@@ -56,7 +56,9 @@ use datafusion_expr::{
 
 use crate::extract_leaf_expressions::is_pure_extraction_projection;
 use crate::optimizer::ApplyOrder;
-use crate::simplify_expressions::{reorder_predicates, simplify_predicates};
+use crate::simplify_expressions::{
+    reorder_disjuncts, reorder_predicates, simplify_predicates,
+};
 use crate::utils::{
     ColumnReference, aggregate_emits_on_empty_input, has_all_column_refs,
     is_restrict_null_predicate, schema_columns,
@@ -873,7 +875,17 @@ impl OptimizerRule for PushDownFilter {
         // Place cheap predicates before expensive ones, so the `AND`
         // evaluator's right-side short-circuit can skip evaluating expensive
         // predicates on rows that have already been filtered out.
-        let (new_predicates, reorder_changed) = reorder_predicates(new_predicates);
+        let (new_predicates, mut reorder_changed) = reorder_predicates(new_predicates);
+        // Likewise within each `OR` chain, whose evaluator skips the right
+        // side for rows the left side already made true.
+        let new_predicates: Vec<Expr> = new_predicates
+            .into_iter()
+            .map(|predicate| {
+                let (predicate, changed) = reorder_disjuncts(predicate);
+                reorder_changed |= changed;
+                predicate
+            })
+            .collect();
 
         // An OR branch can change without changing the number of conjuncts.
         // Ignore permutations from grouping comparisons by column: the cost

@@ -189,6 +189,33 @@ logical_plan
 01)Filter: test_data.float_col >= Float32(1) AND test_data.float_col <= Float32(100) AND test_data.int_col > Int32(10) AND test_data.str_col LIKE Utf8View("A%")
 02)--TableScan: test_data projection=[int_col, float_col, str_col, date_col, bool_col]
 
+# Cheap disjuncts of an OR chain move before expensive ones, keeping their order
+query TT
+EXPLAIN SELECT * FROM test_data
+WHERE str_col LIKE 'A%' OR int_col > 5 OR str_col ~ 'b+' OR float_col < 1;
+----
+logical_plan
+01)Filter: test_data.int_col > Int32(5) OR test_data.float_col < Float32(1) OR test_data.str_col LIKE Utf8View("A%") OR test_data.str_col ~ Utf8View("b+")
+02)--TableScan: test_data projection=[int_col, float_col, str_col, date_col, bool_col]
+
+# The same within an OR chain that is one conjunct of an AND
+query TT
+EXPLAIN SELECT * FROM test_data
+WHERE int_col > 5 AND (str_col LIKE 'A%' OR bool_col);
+----
+logical_plan
+01)Filter: test_data.int_col > Int32(5) AND (test_data.bool_col OR test_data.str_col LIKE Utf8View("A%"))
+02)--TableScan: test_data projection=[int_col, float_col, str_col, date_col, bool_col]
+
+# An OR chain with a volatile disjunct keeps its order
+query TT
+EXPLAIN SELECT * FROM test_data
+WHERE str_col LIKE 'A%' OR random() < 0.5;
+----
+logical_plan
+01)Filter: test_data.str_col LIKE Utf8View("A%") OR random() < Float64(0.5)
+02)--TableScan: test_data projection=[int_col, float_col, str_col, date_col, bool_col]
+
 statement ok
 CREATE TABLE test_data2 (
     id INT,

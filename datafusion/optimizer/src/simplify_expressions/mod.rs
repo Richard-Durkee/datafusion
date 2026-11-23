@@ -21,7 +21,7 @@ mod utils;
 pub use datafusion_expr::simplify::SimplifyContext;
 
 pub use expr_simplifier::*;
-pub(crate) use reorder_predicates::reorder_predicates;
+pub(crate) use reorder_predicates::{reorder_disjuncts, reorder_predicates};
 pub use simplify_exprs::*;
 pub use simplify_predicates::simplify_predicates;
 

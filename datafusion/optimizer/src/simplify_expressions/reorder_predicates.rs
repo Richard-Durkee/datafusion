@@ -2,12 +2,13 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-//! Reorder conjunctive (`AND`) predicates so that cheap predicates run before
-//! expensive ones.
+//! Reorder conjunctive (`AND`) predicates, and the disjuncts of `OR` chains,
+//! so that cheap predicates run before expensive ones.
 //!
 //! DataFusion's `AND` evaluator short-circuits the right-hand side when the
 //! left-hand side keeps few rows, so leading with a cheap predicate shrinks
-//! the batch that expensive ones see.
+//! the batch that expensive ones see. The `OR` evaluator does the same when
+//! the left-hand side leaves few rows `false`.
 //!
 //! The cost of evaluating a predicate is assessed with a simple, conservative
 //! heuristic: we define an allow-list of cheap operations, and consider an
@@ -20,6 +21,7 @@
 //! cost model, add estimated evaluation cost for individual UDFs).
 
 use datafusion_common::tree_node::TreeNode;
+use datafusion_expr::utils::{disjunction, split_binary_owned};
 use datafusion_expr::{BinaryExpr, Expr, Operator};
 
 /// Stable partition of `predicates`: cheap first, then expensive.
@@ -57,6 +59,25 @@ pub(crate) fn reorder_predicates(predicates: Vec<Expr>) -> (Vec<Expr>, bool) {
     }
     cheap.extend(expensive);
     (cheap, true)
+}
+
+/// Reorders the disjuncts of `expr` cheap first if it is an `OR` chain, with
+/// the same stable partition as [`reorder_predicates`].
+///
+/// Returns `(expr, changed)`.
+pub(crate) fn reorder_disjuncts(expr: Expr) -> (Expr, bool) {
+    if !matches!(
+        &expr,
+        Expr::BinaryExpr(BinaryExpr {
+            op: Operator::Or,
+            ..
+        })
+    ) {
+        return (expr, false);
+    }
+    let (disjuncts, changed) = reorder_predicates(split_binary_owned(expr, Operator::Or));
+    let expr = disjunction(disjuncts).expect("an OR chain has at least two disjuncts");
+    (expr, changed)
 }
 
 /// Returns true if every node in `expr`'s tree is cheap.
@@ -165,6 +186,27 @@ mod tests {
         let (out, changed) = reorder_predicates(input.clone());
         assert_eq!(out, input);
         assert!(!changed);
+    }
+
+    #[test]
+    fn or_chain_moves_cheap_disjuncts_first() {
+        let cheap1 = col("a").lt(lit(1));
+        let cheap2 = col("c").gt(lit(2));
+        let expensive = col("b").like(lit("%foo%"));
+        let input = cheap1.clone().or(expensive.clone()).or(cheap2.clone());
+        let (out, changed) = reorder_disjuncts(input);
+        assert_eq!(out, cheap1.or(cheap2).or(expensive));
+        assert!(changed);
+    }
+
+    #[test]
+    fn or_chain_already_cheap_first_or_not_an_or_is_unchanged() {
+        let cheap = col("a").lt(lit(1));
+        let expensive = col("b").like(lit("%foo%"));
+        let input = cheap.clone().or(expensive.clone());
+        assert_eq!(reorder_disjuncts(input.clone()), (input, false));
+        let input = expensive.and(cheap);
+        assert_eq!(reorder_disjuncts(input.clone()), (input, false));
     }
 
     #[test]
