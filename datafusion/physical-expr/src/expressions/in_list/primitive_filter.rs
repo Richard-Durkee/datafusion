@@ -38,18 +38,10 @@ pub(super) fn instantiate_primitive_filter(
         DataType::Int16 => Arc::new(BitmapFilter::<Int16Type>::try_new(in_array)?),
         DataType::UInt16 => Arc::new(BitmapFilter::<UInt16Type>::try_new(in_array)?),
         DataType::Float16 => Arc::new(BitmapFilter::<Float16Type>::try_new(in_array)?),
-        DataType::Int32 => {
-            Arc::new(PrimitiveHashSetFilter::<Int32Type>::try_new(in_array)?)
-        }
-        DataType::Int64 => {
-            Arc::new(PrimitiveHashSetFilter::<Int64Type>::try_new(in_array)?)
-        }
-        DataType::UInt32 => {
-            Arc::new(PrimitiveHashSetFilter::<UInt32Type>::try_new(in_array)?)
-        }
-        DataType::UInt64 => {
-            Arc::new(PrimitiveHashSetFilter::<UInt64Type>::try_new(in_array)?)
-        }
+        DataType::Int32 => range_bitmap_or_hash_set::<Int32Type>(in_array)?,
+        DataType::Int64 => range_bitmap_or_hash_set::<Int64Type>(in_array)?,
+        DataType::UInt32 => range_bitmap_or_hash_set::<UInt32Type>(in_array)?,
+        DataType::UInt64 => range_bitmap_or_hash_set::<UInt64Type>(in_array)?,
         DataType::Decimal128(_, _) => {
             Arc::new(PrimitiveHashSetFilter::<Decimal128Type>::try_new(in_array)?)
         }
@@ -321,6 +313,110 @@ where
 
 /// Wrapper for f32 that implements Hash and Eq using bit comparison.
 /// This treats NaN values as equal to each other when they have the same bit pattern.
+/// Uses a [`RangeBitmapFilter`] when the list's values fit in its range, and
+/// a [`PrimitiveHashSetFilter`] otherwise.
+fn range_bitmap_or_hash_set<T>(in_array: &ArrayRef) -> Result<StaticFilterRef>
+where
+    T: RangeBitmapFilterType,
+    T::Native: Eq + Hash,
+{
+    Ok(match RangeBitmapFilter::<T>::try_new(in_array)? {
+        Some(filter) => Arc::new(filter),
+        None => Arc::new(PrimitiveHashSetFilter::<T>::try_new(in_array)?),
+    })
+}
+
+/// Number of values a [`RangeBitmapFilter`] covers, one bit each (8 KiB).
+const RANGE_BITMAP_BITS: u64 = 1 << 16;
+
+trait RangeBitmapFilterType: ArrowPrimitiveType + Send + Sync + 'static {
+    /// `value - min`, wrapping, as an unsigned offset.
+    fn offset(value: Self::Native, min: Self::Native) -> u64;
+}
+
+macro_rules! range_bitmap_filter_type {
+    ($t:ty, $unsigned:ty) => {
+        impl RangeBitmapFilterType for $t {
+            #[inline(always)]
+            fn offset(value: Self::Native, min: Self::Native) -> u64 {
+                value.wrapping_sub(min) as $unsigned as u64
+            }
+        }
+    };
+}
+range_bitmap_filter_type!(Int32Type, u32);
+range_bitmap_filter_type!(Int64Type, u64);
+range_bitmap_filter_type!(UInt32Type, u32);
+range_bitmap_filter_type!(UInt64Type, u64);
+
+/// Like [`BitmapFilter`], for 32 and 64-bit integers whose list values span
+/// fewer than [`RANGE_BITMAP_BITS`] values: bit `v - min` is set for each
+/// list value `v`.
+///
+/// A needle below `min` wraps to a large offset and fails the range check. A
+/// needle that wraps back into the range only reaches bits past `max - min`,
+/// which are never set.
+struct RangeBitmapFilter<T: RangeBitmapFilterType> {
+    null_count: usize,
+    min: T::Native,
+    bits: Box<[u64; 1024]>,
+}
+
+impl<T: RangeBitmapFilterType> RangeBitmapFilter<T> {
+    /// Returns `None` when the list has no non-null values or they span too
+    /// many values.
+    fn try_new(in_array: &ArrayRef) -> Result<Option<Self>> {
+        let prim_array = in_array.as_primitive_opt::<T>().ok_or_else(|| {
+            exec_datafusion_err!("RangeBitmapFilter: expected {} array", T::DATA_TYPE)
+        })?;
+        let Some(min) = arrow::compute::min(prim_array) else {
+            return Ok(None);
+        };
+        let max = arrow::compute::max(prim_array).unwrap();
+        if T::offset(max, min) >= RANGE_BITMAP_BITS {
+            return Ok(None);
+        }
+        let mut bits = <Box<[u64; 1024]> as BitmapStorage>::new_zeroed();
+        for v in prim_array.iter().flatten() {
+            bits.set_bit(T::offset(v, min) as usize);
+        }
+        Ok(Some(Self {
+            null_count: prim_array.null_count(),
+            min,
+            bits,
+        }))
+    }
+}
+
+impl<T: RangeBitmapFilterType> StaticFilter for RangeBitmapFilter<T> {
+    fn null_count(&self) -> usize {
+        self.null_count
+    }
+
+    fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
+        let v = v.as_primitive_opt::<T>().ok_or_else(|| {
+            exec_datafusion_err!("RangeBitmapFilter: expected {} array", T::DATA_TYPE)
+        })?;
+        let input_values = v.values();
+        Ok(build_in_list_result(
+            v.len(),
+            v.nulls(),
+            self.null_count > 0,
+            negated,
+            #[inline(always)]
+            |i| {
+                let offset =
+                    T::offset(unsafe { *input_values.get_unchecked(i) }, self.min);
+                // Mask the index so the lookup stays in bounds without a branch.
+                (offset < RANGE_BITMAP_BITS)
+                    & self
+                        .bits
+                        .get_bit((offset & (RANGE_BITMAP_BITS - 1)) as usize)
+            },
+        ))
+    }
+}
+
 #[derive(Clone, Copy)]
 struct OrderedFloat32(f32);
 
@@ -465,6 +561,88 @@ mod tests {
             filter.contains(needles, false)?,
             BooleanArray::from(expected)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn range_bitmap_matches_hash_set() -> Result<()> {
+        use arrow::array::{Int32Array, Int64Array, UInt64Array};
+        // Lists near the type bounds, with negative values, and with NULLs.
+        let int32_lists: Vec<Vec<Option<i32>>> = vec![
+            vec![Some(-5), Some(0), Some(7), None, Some(40000)],
+            vec![Some(i32::MAX), Some(i32::MAX - 3), Some(i32::MAX - 65535)],
+            vec![Some(i32::MIN), Some(i32::MIN + 2)],
+        ];
+        let int32_needles = Int32Array::from(
+            [
+                -6,
+                -5,
+                0,
+                1,
+                7,
+                40000,
+                40001,
+                65530,
+                i32::MAX,
+                i32::MAX - 1,
+                i32::MAX - 3,
+            ]
+            .into_iter()
+            .chain([i32::MIN, i32::MIN + 1, i32::MIN + 2, i32::MIN + 11])
+            .chain([i32::MAX - 65535, i32::MAX - 65536])
+            .map(Some)
+            .chain([None])
+            .collect::<Vec<_>>(),
+        );
+        for list in int32_lists {
+            let in_array: ArrayRef = Arc::new(Int32Array::from(list));
+            let bitmap = RangeBitmapFilter::<Int32Type>::try_new(&in_array)?.unwrap();
+            let hash = PrimitiveHashSetFilter::<Int32Type>::try_new(&in_array)?;
+            for negated in [false, true] {
+                assert_eq!(
+                    bitmap.contains(&int32_needles, negated)?,
+                    hash.contains(&int32_needles, negated)?
+                );
+            }
+        }
+
+        let in_array: ArrayRef = Arc::new(Int64Array::from(vec![i64::MIN, i64::MIN + 9]));
+        let needles =
+            Int64Array::from(vec![i64::MIN, i64::MIN + 9, i64::MAX, 0, i64::MIN + 1]);
+        let bitmap = RangeBitmapFilter::<Int64Type>::try_new(&in_array)?.unwrap();
+        assert_contains(
+            &bitmap,
+            &needles,
+            vec![
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+            ],
+        )?;
+
+        let in_array: ArrayRef =
+            Arc::new(UInt64Array::from(vec![u64::MAX, u64::MAX - 2]));
+        let needles = UInt64Array::from(vec![u64::MAX, u64::MAX - 1, 0, 1]);
+        let bitmap = RangeBitmapFilter::<UInt64Type>::try_new(&in_array)?.unwrap();
+        assert_contains(
+            &bitmap,
+            &needles,
+            vec![Some(true), Some(false), Some(false), Some(false)],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn range_bitmap_rejects_wide_or_empty_lists() -> Result<()> {
+        use arrow::array::Int64Array;
+        let wide: ArrayRef = Arc::new(Int64Array::from(vec![0, 1 << 16]));
+        assert!(RangeBitmapFilter::<Int64Type>::try_new(&wide)?.is_none());
+        let fits: ArrayRef = Arc::new(Int64Array::from(vec![0, (1 << 16) - 1]));
+        assert!(RangeBitmapFilter::<Int64Type>::try_new(&fits)?.is_some());
+        let nulls: ArrayRef = Arc::new(Int64Array::from(vec![None, None]));
+        assert!(RangeBitmapFilter::<Int64Type>::try_new(&nulls)?.is_none());
         Ok(())
     }
 
