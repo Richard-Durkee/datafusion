@@ -314,7 +314,7 @@ where
 /// Wrapper for f32 that implements Hash and Eq using bit comparison.
 /// This treats NaN values as equal to each other when they have the same bit pattern.
 /// Uses a [`RangeBitmapFilter`] when the list's values fit in its range, and
-/// a [`PrimitiveHashSetFilter`] otherwise.
+/// a [`PrefilteredHashSetFilter`] otherwise.
 fn range_bitmap_or_hash_set<T>(in_array: &ArrayRef) -> Result<StaticFilterRef>
 where
     T: RangeBitmapFilterType,
@@ -322,8 +322,103 @@ where
 {
     Ok(match RangeBitmapFilter::<T>::try_new(in_array)? {
         Some(filter) => Arc::new(filter),
-        None => Arc::new(PrimitiveHashSetFilter::<T>::try_new(in_array)?),
+        None => Arc::new(PrefilteredHashSetFilter::<T>::try_new(in_array)?),
     })
+}
+
+/// A [`PrimitiveHashSetFilter`] behind a one-hash Bloom filter.
+///
+/// Most needles of a selective `IN` list are not in it. The Bloom filter
+/// rejects almost all of them with a multiply, a shift and a bit test, so
+/// only the few that pass need a hash set lookup.
+struct PrefilteredHashSetFilter<T: RangeBitmapFilterType>
+where
+    T::Native: Eq + Hash,
+{
+    /// One bit per hash bucket, `1 << bits_log2` bits in total.
+    bloom: Vec<u64>,
+    /// `64 - bits_log2`: the shift that turns a 64-bit hash into a bucket.
+    shift: u32,
+    set: PrimitiveHashSetFilter<T>,
+}
+
+/// About 64 bits per list value keep false positives near 1.5%, within these
+/// bounds (512 bytes to 128 KiB).
+const PREFILTER_MIN_BITS_LOG2: u32 = 12;
+const PREFILTER_MAX_BITS_LOG2: u32 = 20;
+
+impl<T: RangeBitmapFilterType> PrefilteredHashSetFilter<T>
+where
+    T::Native: Eq + Hash,
+{
+    fn try_new(in_array: &ArrayRef) -> Result<Self> {
+        let set = PrimitiveHashSetFilter::<T>::try_new(in_array)?;
+        let prim_array = in_array.as_primitive_opt::<T>().ok_or_else(|| {
+            exec_datafusion_err!(
+                "PrefilteredHashSetFilter: expected {} array",
+                T::DATA_TYPE
+            )
+        })?;
+        let bits = (prim_array.len() - prim_array.null_count()).max(1) * 64;
+        let bits_log2 = bits
+            .next_power_of_two()
+            .trailing_zeros()
+            .clamp(PREFILTER_MIN_BITS_LOG2, PREFILTER_MAX_BITS_LOG2);
+        let mut filter = Self {
+            bloom: vec![0; 1 << (bits_log2 - 6)],
+            shift: 64 - bits_log2,
+            set,
+        };
+        for v in prim_array.iter().flatten() {
+            let bucket = filter.bucket(v);
+            filter.bloom[bucket / 64] |= 1 << (bucket % 64);
+        }
+        Ok(filter)
+    }
+
+    /// Fibonacci hashing: the top bits of `value * 2^64 / φ`.
+    #[inline(always)]
+    fn bucket(&self, value: T::Native) -> usize {
+        let bits = T::offset(value, T::Native::default());
+        (bits.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
+    }
+
+    #[inline(always)]
+    fn may_contain(&self, value: T::Native) -> bool {
+        let bucket = self.bucket(value);
+        // `bucket` is below the number of bits by construction.
+        (unsafe { *self.bloom.get_unchecked(bucket / 64) } >> (bucket % 64)) & 1 != 0
+    }
+}
+
+impl<T: RangeBitmapFilterType> StaticFilter for PrefilteredHashSetFilter<T>
+where
+    T::Native: Eq + Hash,
+{
+    fn null_count(&self) -> usize {
+        self.set.null_count
+    }
+
+    fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
+        let v = v.as_primitive_opt::<T>().ok_or_else(|| {
+            exec_datafusion_err!(
+                "PrefilteredHashSetFilter: expected {} array",
+                T::DATA_TYPE
+            )
+        })?;
+        let input_values = v.values();
+        Ok(build_in_list_result(
+            v.len(),
+            v.nulls(),
+            self.set.null_count > 0,
+            negated,
+            #[inline(always)]
+            |i| {
+                let needle = unsafe { *input_values.get_unchecked(i) };
+                self.may_contain(needle) && self.set.values.contains(&needle)
+            },
+        ))
+    }
 }
 
 /// Number of values a [`RangeBitmapFilter`] covers, one bit each (8 KiB).
@@ -630,6 +725,59 @@ mod tests {
             &bitmap,
             &needles,
             vec![Some(true), Some(false), Some(false), Some(false)],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn prefiltered_hash_set_matches_hash_set() -> Result<()> {
+        use arrow::array::{Int32Array, Int64Array, UInt64Array};
+        // Wide lists, including values that share their low bits and a NULL.
+        let int64_list: Vec<Option<i64>> = (0..300)
+            .map(|i| Some(i * 65536 - 7_000_000))
+            .chain([Some(i64::MIN), Some(i64::MAX), None])
+            .collect();
+        let in_array: ArrayRef = Arc::new(Int64Array::from(int64_list));
+        let needles = Int64Array::from(
+            (-2_000..2_000)
+                .map(|i| Some(i * 32768 - 7_000_000))
+                .chain([Some(i64::MIN), Some(i64::MAX), Some(0), None])
+                .collect::<Vec<_>>(),
+        );
+        let prefiltered = PrefilteredHashSetFilter::<Int64Type>::try_new(&in_array)?;
+        let hash = PrimitiveHashSetFilter::<Int64Type>::try_new(&in_array)?;
+        for negated in [false, true] {
+            assert_eq!(
+                prefiltered.contains(&needles, negated)?,
+                hash.contains(&needles, negated)?
+            );
+        }
+
+        let in_array: ArrayRef =
+            Arc::new(Int32Array::from(vec![i32::MIN, -1, 1 << 20, i32::MAX]));
+        let needles =
+            Int32Array::from(vec![i32::MIN, -1, 0, 1 << 20, (1 << 20) + 1, i32::MAX]);
+        let prefiltered = PrefilteredHashSetFilter::<Int32Type>::try_new(&in_array)?;
+        assert_contains(
+            &prefiltered,
+            &needles,
+            vec![
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(true),
+            ],
+        )?;
+
+        let in_array: ArrayRef = Arc::new(UInt64Array::from(vec![0, u64::MAX]));
+        let needles = UInt64Array::from(vec![0, 1, u64::MAX]);
+        let prefiltered = PrefilteredHashSetFilter::<UInt64Type>::try_new(&in_array)?;
+        assert_contains(
+            &prefiltered,
+            &needles,
+            vec![Some(true), Some(false), Some(true)],
         )?;
         Ok(())
     }
