@@ -11,8 +11,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, ListArray, NullBufferBuilder, StructArray,
-    UInt32Array, make_array, new_empty_array,
+    Array, ArrayData, ArrayRef, AsArray, BooleanArray, ListArray, MutableArrayData,
+    NullBufferBuilder, StructArray, UInt32Array, make_array, new_empty_array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::compute::{SortOptions, cast, filter, take as take_array};
@@ -518,6 +518,79 @@ impl Accumulator for ArrayAggAccumulator {
     }
 }
 
+/// Minimum average run length at which [`ArrayAggGroupsAccumulator`] stores
+/// and copies runs of rows instead of single rows.
+const MIN_AVG_RUN_LENGTH: usize = 4;
+
+/// A run of consecutive rows of one stored batch that belong to the same group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GroupRun {
+    group: u32,
+    start: u32,
+    len: u32,
+}
+
+/// Appends rows `start..start + len` of `group` to `runs`, extending the last
+/// run when the rows continue it.
+fn push_run(runs: &mut Vec<GroupRun>, group: u32, start: u32, len: u32) {
+    match runs.last_mut() {
+        Some(last) if last.group == group && last.start + last.len == start => {
+            last.len += len;
+        }
+        _ => runs.push(GroupRun { group, start, len }),
+    }
+}
+
+/// The rows of one stored batch that belong to each group, in row order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BatchEntries {
+    /// One `(group_idx, row_idx)` pair per row, for batches whose rows change
+    /// group often.
+    Rows(Vec<(u32, u32)>),
+    /// Runs of consecutive rows of one group. Merged partial states contribute
+    /// whole lists, and sorted or clustered input has long runs too.
+    Runs(Vec<GroupRun>),
+}
+
+impl BatchEntries {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Rows(rows) => rows.is_empty(),
+            Self::Runs(runs) => runs.is_empty(),
+        }
+    }
+
+    fn shrink_to_fit(&mut self) {
+        match self {
+            Self::Rows(rows) => rows.shrink_to_fit(),
+            Self::Runs(runs) => runs.shrink_to_fit(),
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            Self::Rows(rows) => rows.capacity() * size_of::<(u32, u32)>(),
+            Self::Runs(runs) => runs.capacity() * size_of::<GroupRun>(),
+        }
+    }
+
+    /// Calls `f` with every entry as a run, a row being a run of length 1.
+    fn for_each_run(&self, mut f: impl FnMut(GroupRun)) {
+        match self {
+            Self::Rows(rows) => {
+                for &(group, start) in rows {
+                    f(GroupRun {
+                        group,
+                        start,
+                        len: 1,
+                    });
+                }
+            }
+            Self::Runs(runs) => runs.iter().copied().for_each(f),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ArrayAggGroupsAccumulator {
     datatype: DataType,
@@ -525,15 +598,20 @@ struct ArrayAggGroupsAccumulator {
     /// Source arrays — input arrays (from update_batch) or list backing
     /// arrays (from merge_batch).
     batches: Vec<ArrayRef>,
-    /// Per-batch list of (group_idx, row_idx) pairs.
-    batch_entries: Vec<Vec<(u32, u32)>>,
+    /// Per batch, which of its rows belong to which group.
+    batch_entries: Vec<BatchEntries>,
     /// Total number of groups tracked.
     num_groups: usize,
+    /// Whether batches with long runs are stored and copied as runs.
+    /// `MutableArrayData` concatenates dictionaries without merging them,
+    /// which can overflow the key type, so dictionaries always use rows.
+    store_runs: bool,
 }
 
 impl ArrayAggGroupsAccumulator {
     fn new(datatype: DataType, ignore_nulls: bool) -> Self {
         Self {
+            store_runs: !datatype_contains_dictionary(&datatype),
             datatype,
             ignore_nulls,
             batches: Vec::new(),
@@ -550,10 +628,90 @@ impl ArrayAggGroupsAccumulator {
         self.num_groups = 0;
     }
 
+    /// Gathers the values of the first `group_starts.len()` groups row by row
+    /// with `interleave`. `group_starts` holds each group's output offset.
+    fn gather_rows(&self, group_starts: &[i32], total_rows: usize) -> Result<ArrayRef> {
+        let emit_groups = group_starts.len();
+        let mut write_positions: Vec<u32> =
+            group_starts.iter().map(|&offset| offset as u32).collect();
+        let mut indices = vec![(0usize, 0usize); total_rows];
+        for (batch_idx, entries) in self.batch_entries.iter().enumerate() {
+            match entries {
+                BatchEntries::Rows(rows) => {
+                    for &(g, r) in rows {
+                        let g = g as usize;
+                        if g < emit_groups {
+                            let wp = write_positions[g] as usize;
+                            indices[wp] = (batch_idx, r as usize);
+                            write_positions[g] += 1;
+                        }
+                    }
+                }
+                BatchEntries::Runs(runs) => {
+                    for run in runs {
+                        let g = run.group as usize;
+                        if g < emit_groups {
+                            let wp = write_positions[g] as usize;
+                            let rows = run.start as usize..(run.start + run.len) as usize;
+                            for (index, row) in indices[wp..].iter_mut().zip(rows) {
+                                *index = (batch_idx, row);
+                            }
+                            write_positions[g] += run.len;
+                        }
+                    }
+                }
+            }
+        }
+        let sources: Vec<&dyn Array> = self.batches.iter().map(|b| b.as_ref()).collect();
+        Ok(arrow::compute::interleave(&sources, &indices)?)
+    }
+
+    /// Gathers the values of the first `emit_groups` groups by copying each
+    /// run whole, after sorting the runs into group order.
+    fn gather_runs(
+        &self,
+        emit_groups: usize,
+        total_runs: usize,
+        total_rows: usize,
+    ) -> Result<ArrayRef> {
+        let mut write_positions = vec![0u32; emit_groups];
+        for entries in &self.batch_entries {
+            entries.for_each_run(|run| {
+                if let Some(count) = write_positions.get_mut(run.group as usize) {
+                    *count += 1;
+                }
+            });
+        }
+        let mut next = 0u32;
+        for position in &mut write_positions {
+            let count = *position;
+            *position = next;
+            next += count;
+        }
+
+        let mut ordered_runs = vec![(0usize, 0usize, 0usize); total_runs];
+        for (batch_idx, entries) in self.batch_entries.iter().enumerate() {
+            entries.for_each_run(|run| {
+                if let Some(wp) = write_positions.get_mut(run.group as usize) {
+                    ordered_runs[*wp as usize] =
+                        (batch_idx, run.start as usize, run.len as usize);
+                    *wp += 1;
+                }
+            });
+        }
+
+        let data: Vec<ArrayData> = self.batches.iter().map(|b| b.to_data()).collect();
+        let mut mutable = MutableArrayData::new(data.iter().collect(), false, total_rows);
+        for (batch_idx, start, len) in ordered_runs {
+            mutable.try_extend(batch_idx, start, start + len)?;
+        }
+        Ok(make_array(mutable.freeze()))
+    }
+
     fn compact_retained_state(&mut self, emit_groups: usize) -> Result<()> {
         // EmitTo::First is used to recover from memory pressure. Simply
         // removing emitted entries in place is not enough because mixed batches
-        // would continue to pin their original Array arrays, even if only a few
+        // would continue to pin their original arrays, even if only a few
         // retained rows remain.
         //
         // Rebuild the retained state from scratch so fully emitted batches are
@@ -567,44 +725,65 @@ impl ArrayAggGroupsAccumulator {
         let mut batch_entries = Vec::new();
 
         for (batch, entries) in old_batches.into_iter().zip(old_batch_entries) {
-            let retained_len = entries.iter().filter(|(g, _)| *g >= emit_groups).count();
+            // The retained runs, with their groups renumbered to start from 0.
+            let mut retained = Vec::new();
+            let mut num_entries = 0;
+            entries.for_each_run(|run| {
+                num_entries += 1;
+                if run.group >= emit_groups {
+                    retained.push(GroupRun {
+                        group: run.group - emit_groups,
+                        ..run
+                    });
+                }
+            });
 
-            if retained_len == 0 {
+            if retained.is_empty() {
                 continue;
             }
 
-            if retained_len == entries.len() {
+            if retained.len() == num_entries {
                 // Nothing was emitted from this batch, so we keep the existing
-                // array and only renumber the remaining group IDs so that they
-                // start from 0.
-                let mut retained_entries = entries;
-                for (g, _) in &mut retained_entries {
-                    *g -= emit_groups;
+                // array and only renumber the remaining group IDs.
+                let mut entries = entries;
+                match &mut entries {
+                    BatchEntries::Rows(rows) => {
+                        for (g, _) in rows {
+                            *g -= emit_groups;
+                        }
+                    }
+                    BatchEntries::Runs(runs) => {
+                        for run in runs {
+                            run.group -= emit_groups;
+                        }
+                    }
                 }
-                retained_entries.shrink_to_fit();
+                entries.shrink_to_fit();
                 batches.push(batch);
-                batch_entries.push(retained_entries);
+                batch_entries.push(entries);
                 continue;
             }
 
-            let mut retained_entries = Vec::with_capacity(retained_len);
-            let mut retained_rows = Vec::with_capacity(retained_len);
-
-            for (g, r) in entries {
-                if g >= emit_groups {
-                    // Compute the new `(group_idx, row_idx)` pair for a
-                    // retained row. `group_idx` is renumbered to start from
-                    // 0, and `row_idx` points into the new dense batch we are
-                    // building.
-                    retained_entries.push((g - emit_groups, retained_rows.len() as u32));
-                    retained_rows.push(r);
+            // Point the retained entries into the new dense batch we are
+            // building.
+            let mut retained_rows = Vec::new();
+            let mut new_entries = match entries {
+                BatchEntries::Rows(_) => BatchEntries::Rows(Vec::new()),
+                BatchEntries::Runs(_) => BatchEntries::Runs(Vec::new()),
+            };
+            for run in retained {
+                let start = retained_rows.len() as u32;
+                match &mut new_entries {
+                    BatchEntries::Rows(rows) => {
+                        rows.extend((start..start + run.len).map(|r| (run.group, r)))
+                    }
+                    BatchEntries::Runs(runs) => push_run(runs, run.group, start, run.len),
                 }
+                retained_rows.extend(run.start..run.start + run.len);
             }
+            new_entries.shrink_to_fit();
 
-            debug_assert_eq!(retained_entries.len(), retained_len);
-            debug_assert_eq!(retained_rows.len(), retained_len);
-
-            let batch = if retained_len == batch.len() {
+            let batch = if retained_rows.len() == batch.len() {
                 batch
             } else {
                 // Compact mixed batches so retained rows no longer pin the
@@ -614,7 +793,7 @@ impl ArrayAggGroupsAccumulator {
             };
 
             batches.push(batch);
-            batch_entries.push(retained_entries);
+            batch_entries.push(new_entries);
         }
 
         self.batches = batches;
@@ -626,8 +805,8 @@ impl ArrayAggGroupsAccumulator {
 }
 
 impl GroupsAccumulator for ArrayAggGroupsAccumulator {
-    /// Store a reference to the input batch, plus a `(group_idx, row_idx)` pair
-    /// for every row.
+    /// Store a reference to the input batch, plus which of its rows belong to
+    /// which group.
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
@@ -647,11 +826,14 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
         };
 
         // Without a filter or nulls to skip, every row becomes an entry
-        let mut entries = if opt_filter.is_none() && nulls.is_none() {
+        let mut rows = if opt_filter.is_none() && nulls.is_none() {
             Vec::with_capacity(group_indices.len())
         } else {
             Vec::new()
         };
+        // Number of times the group changes between consecutive kept rows.
+        let mut group_changes = 0;
+        let mut prev_group = usize::MAX;
 
         for (row_idx, &group_idx) in group_indices.iter().enumerate() {
             // Skip filtered rows
@@ -668,8 +850,22 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
                 continue;
             }
 
-            entries.push((group_idx as u32, row_idx as u32));
+            group_changes += usize::from(group_idx != prev_group);
+            prev_group = group_idx;
+            rows.push((group_idx as u32, row_idx as u32));
         }
+
+        // Store long runs of one group as runs instead.
+        let entries =
+            if self.store_runs && rows.len() >= MIN_AVG_RUN_LENGTH * group_changes {
+                let mut runs = Vec::with_capacity(group_changes);
+                for (group, row) in rows {
+                    push_run(&mut runs, group, row, 1);
+                }
+                BatchEntries::Runs(runs)
+            } else {
+                BatchEntries::Rows(rows)
+            };
 
         // We only need to record the batch if it was non-empty.
         if !entries.is_empty() {
@@ -683,33 +879,48 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
     /// Produce a `ListArray` ordered by group index: the list at
     /// position N contains the aggregated values for group N.
     ///
-    /// Uses a counting sort to rearrange the stored `(group, row)`
-    /// entries into group order, then calls `interleave` to gather
-    /// the values into a flat array that backs the output `ListArray`.
+    /// Uses a counting sort to rearrange the stored entries into group order,
+    /// then gathers the values into a flat array that backs the output
+    /// `ListArray`.
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
         let emit_groups = match emit_to {
             EmitTo::All => self.num_groups,
             EmitTo::First(n) => n,
         };
 
-        // Step 1: Count entries per group. For EmitTo::First(n), only groups
-        // 0..n are counted; the rest are retained to be emitted in the future.
+        // Step 1: Count values per group, and runs overall, a row counting as a
+        // run of one. For EmitTo::First(n), only groups 0..n are counted; the
+        // rest are retained to be emitted in the future.
         let mut counts = vec![0u32; emit_groups];
+        let mut total_runs = 0usize;
         for entries in &self.batch_entries {
-            for &(g, _) in entries {
-                let g = g as usize;
-                if g < emit_groups {
-                    counts[g] += 1;
+            match entries {
+                BatchEntries::Rows(rows) => {
+                    for &(g, _) in rows {
+                        let g = g as usize;
+                        if g < emit_groups {
+                            counts[g] += 1;
+                            total_runs += 1;
+                        }
+                    }
+                }
+                BatchEntries::Runs(runs) => {
+                    for run in runs {
+                        let g = run.group as usize;
+                        if g < emit_groups {
+                            counts[g] += run.len;
+                            total_runs += 1;
+                        }
+                    }
                 }
             }
         }
 
         // Step 2: Do a prefix sum over the counts and use it to build ListArray
-        // offsets, null buffer, and write positions for the counting sort.
+        // offsets and the null buffer.
         let mut offsets = Vec::<i32>::with_capacity(emit_groups + 1);
         offsets.push(0);
         let mut nulls_builder = NullBufferBuilder::new(emit_groups);
-        let mut write_positions = Vec::with_capacity(emit_groups);
         let mut cur_offset = 0u32;
         for &count in &counts {
             if count == 0 {
@@ -717,32 +928,19 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
             } else {
                 nulls_builder.append_non_null();
             }
-            write_positions.push(cur_offset);
             cur_offset += count;
             offsets.push(cur_offset as i32);
         }
         let total_rows = cur_offset as usize;
 
-        // Step 3: Scatter entries into group order using the counting sort. The
-        // batch index is implicit from the outer loop position.
+        // Step 3: Gather the values in group order. Long runs are copied whole;
+        // short ones are gathered row by row.
         let flat_values = if total_rows == 0 {
             new_empty_array(&self.datatype)
+        } else if !self.store_runs || total_runs * MIN_AVG_RUN_LENGTH > total_rows {
+            self.gather_rows(&offsets[..emit_groups], total_rows)?
         } else {
-            let mut interleave_indices = vec![(0usize, 0usize); total_rows];
-            for (batch_idx, entries) in self.batch_entries.iter().enumerate() {
-                for &(g, r) in entries {
-                    let g = g as usize;
-                    if g < emit_groups {
-                        let wp = write_positions[g] as usize;
-                        interleave_indices[wp] = (batch_idx, r as usize);
-                        write_positions[g] += 1;
-                    }
-                }
-            }
-
-            let sources: Vec<&dyn Array> =
-                self.batches.iter().map(|b| b.as_ref()).collect();
-            arrow::compute::interleave(&sources, &interleave_indices)?
+            self.gather_runs(emit_groups, total_runs, total_rows)?
         };
 
         // Step 4: Release state for emitted groups.
@@ -776,24 +974,37 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
         // Push the ListArray's backing values array as a single batch.
         let list_values = input_list.values();
         let list_offsets = input_list.offsets();
+        let span_len = offset_span(list_offsets).1;
 
-        // Without null rows, every value in the offset span becomes an entry
-        let mut entries = if input_list.null_count() == 0 {
-            Vec::with_capacity(offset_span(list_offsets).1)
-        } else {
-            Vec::new()
-        };
-
-        for (row_idx, &group_idx) in group_indices.iter().enumerate() {
-            if input_list.is_null(row_idx) {
-                continue;
-            }
-            let start = list_offsets[row_idx] as u32;
-            let end = list_offsets[row_idx + 1] as u32;
-            for pos in start..end {
-                entries.push((group_idx as u32, pos));
-            }
-        }
+        let entries =
+            if self.store_runs && span_len >= MIN_AVG_RUN_LENGTH * group_indices.len() {
+                // Each list becomes one run.
+                let mut runs = Vec::with_capacity(group_indices.len());
+                for (row_idx, &group_idx) in group_indices.iter().enumerate() {
+                    let start = list_offsets[row_idx] as u32;
+                    let end = list_offsets[row_idx + 1] as u32;
+                    if input_list.is_valid(row_idx) && start < end {
+                        push_run(&mut runs, group_idx as u32, start, end - start);
+                    }
+                }
+                BatchEntries::Runs(runs)
+            } else {
+                // Without null rows, every value in the offset span becomes an entry
+                let mut rows = if input_list.null_count() == 0 {
+                    Vec::with_capacity(span_len)
+                } else {
+                    Vec::new()
+                };
+                for (row_idx, &group_idx) in group_indices.iter().enumerate() {
+                    if input_list.is_null(row_idx) {
+                        continue;
+                    }
+                    let start = list_offsets[row_idx] as u32;
+                    let end = list_offsets[row_idx + 1] as u32;
+                    rows.extend((start..end).map(|pos| (group_idx as u32, pos)));
+                }
+                BatchEntries::Rows(rows)
+            };
 
         if !entries.is_empty() {
             self.batches.push(Arc::clone(list_values));
@@ -826,9 +1037,9 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
             + self
                 .batch_entries
                 .iter()
-                .map(|e| e.capacity() * size_of::<(u32, u32)>())
+                .map(BatchEntries::size)
                 .sum::<usize>()
-            + self.batch_entries.capacity() * size_of::<Vec<(u32, u32)>>()
+            + self.batch_entries.capacity() * size_of::<BatchEntries>()
     }
 }
 
@@ -4108,6 +4319,135 @@ mod tests {
     }
 
     #[test]
+    fn groups_accumulator_merges_long_lists() -> Result<()> {
+        // Each list is stored as one run, and consecutive lists of the same
+        // group extend it. The null last list is skipped.
+        let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let mut values: Vec<Option<i32>> = (0..21).map(Some).collect();
+        values[2] = None;
+        let state = ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Int32, true)),
+            OffsetBuffer::from_lengths([6, 5, 0, 8, 2]),
+            Arc::new(Int32Array::from(values.clone())),
+            Some(NullBuffer::from(vec![true, true, true, true, false])),
+        );
+        acc.merge_batch(&[Arc::new(state)], &[1, 1, 0, 2, 0], 3)?;
+        assert_eq!(
+            acc.batch_entries,
+            vec![BatchEntries::Runs(vec![
+                GroupRun {
+                    group: 1,
+                    start: 0,
+                    len: 11
+                },
+                GroupRun {
+                    group: 2,
+                    start: 11,
+                    len: 8
+                },
+            ])]
+        );
+
+        let vals = eval_i32_lists(&mut acc, EmitTo::All)?;
+        assert_eq!(
+            vals,
+            vec![
+                None,
+                Some(values[0..11].to_vec()),
+                Some(values[11..19].to_vec()),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Feeds the same random updates and merges to the groups accumulator and
+    /// to a plain `Vec` per group, emitting in two steps, and checks that both
+    /// agree. Batches with short and long runs mix both storage forms and both
+    /// gather strategies.
+    #[test]
+    fn groups_accumulator_matches_model() -> Result<()> {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        for seed in 0..50 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let num_groups = rng.random_range(1..20);
+            let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+            let mut model: Vec<Vec<Option<i32>>> = vec![vec![]; num_groups];
+            let mut next_value = 0;
+            let mut value = |rng: &mut StdRng| {
+                next_value += 1;
+                rng.random_bool(0.9).then_some(next_value)
+            };
+
+            for _ in 0..rng.random_range(1..6) {
+                // Short runs are stored as rows, long ones as runs.
+                let max_len = if rng.random_bool(0.5) { 2 } else { 40 };
+                // An update with runs of a random group.
+                let mut values = vec![];
+                let mut groups = vec![];
+                while values.len() < 64 {
+                    let g = rng.random_range(0..num_groups);
+                    for _ in 0..rng.random_range(1..=max_len) {
+                        values.push(value(&mut rng));
+                        groups.push(g);
+                    }
+                }
+                let filter = BooleanArray::from(
+                    (0..values.len())
+                        .map(|_| rng.random_bool(0.9))
+                        .collect::<Vec<_>>(),
+                );
+                for (i, &g) in groups.iter().enumerate() {
+                    if filter.value(i) {
+                        model[g].push(values[i]);
+                    }
+                }
+                let values: ArrayRef = Arc::new(Int32Array::from(values));
+                acc.update_batch(&[values], &groups, Some(&filter), num_groups)?;
+
+                // A merge of random lists, some of them null.
+                let mut lengths = vec![];
+                let mut list_values = vec![];
+                let mut valid = vec![];
+                let mut groups = vec![];
+                for _ in 0..rng.random_range(1..16) {
+                    let len = rng.random_range(0..=max_len);
+                    let is_valid = rng.random_bool(0.9);
+                    let g = rng.random_range(0..num_groups);
+                    for _ in 0..len {
+                        let v = value(&mut rng);
+                        list_values.push(v);
+                        if is_valid {
+                            model[g].push(v);
+                        }
+                    }
+                    lengths.push(len);
+                    valid.push(is_valid);
+                    groups.push(g);
+                }
+                let state = ListArray::new(
+                    Arc::new(Field::new_list_field(DataType::Int32, true)),
+                    OffsetBuffer::from_lengths(lengths),
+                    Arc::new(Int32Array::from(list_values)),
+                    Some(NullBuffer::from(valid)),
+                );
+                acc.merge_batch(&[Arc::new(state)], &groups, num_groups)?;
+            }
+
+            let expected: Vec<Option<Vec<Option<i32>>>> = model
+                .into_iter()
+                .map(|values| (!values.is_empty()).then_some(values))
+                .collect();
+            let first = rng.random_range(0..=num_groups);
+            let mut actual = eval_i32_lists(&mut acc, EmitTo::First(first))?;
+            actual.extend(eval_i32_lists(&mut acc, EmitTo::All)?);
+            assert_eq!(actual, expected, "seed {seed}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn groups_accumulator_multiple_batches() -> Result<()> {
         let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
 
@@ -4177,7 +4517,7 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(retained.values(), &[40]);
-        assert_eq!(acc.batch_entries, vec![vec![(0, 0)]]);
+        assert_eq!(acc.batch_entries, vec![BatchEntries::Rows(vec![(0, 0)])]);
 
         // Emit remaining group 1
         let vals = eval_i32_lists(&mut acc, EmitTo::All)?;
@@ -4207,7 +4547,10 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(retained.values(), &[20, 40]);
-        assert_eq!(acc.batch_entries, vec![vec![(0, 0), (0, 1)]]);
+        assert_eq!(
+            acc.batch_entries,
+            vec![BatchEntries::Rows(vec![(0, 0), (0, 1)])]
+        );
         assert!(acc.size() < size_before);
 
         let vals = eval_i32_lists(&mut acc, EmitTo::All)?;

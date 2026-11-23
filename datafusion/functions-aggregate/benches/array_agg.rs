@@ -636,9 +636,166 @@ fn ordered_array_agg_wide_utf8_benchmark(c: &mut Criterion) {
     );
 }
 
+/// Benchmarks the final aggregation stage of a grouped `array_agg`: merging
+/// `num_batches` partial states of `num_groups` lists each, then emitting.
+fn array_agg_groups_merge_evaluate_bench(
+    c: &mut Criterion,
+    value_type: &DataType,
+    num_groups: usize,
+    values_per_list: usize,
+) {
+    let num_batches = 8;
+    let schema = Schema::new(vec![Field::new("value", value_type.clone(), true)]);
+    let value_expr = col("value", &schema).unwrap();
+    let value_field = value_expr.return_field(&schema).unwrap();
+    let list_field = Arc::new(Field::new_list_field(value_type.clone(), true));
+    let return_field: FieldRef =
+        Field::new("array_agg", DataType::List(Arc::clone(&list_field)), true).into();
+    let args = AccumulatorArgs {
+        return_field,
+        schema: &schema,
+        expr_fields: std::slice::from_ref(&value_field),
+        ignore_nulls: false,
+        order_bys: &[],
+        is_reversed: false,
+        name: "array_agg(value)",
+        is_distinct: false,
+        exprs: std::slice::from_ref(&value_expr),
+    };
+    let array_agg = ArrayAgg::default();
+
+    let num_values = num_groups * values_per_list;
+    let values: ArrayRef = match value_type {
+        DataType::Int64 => Arc::new(Int64Array::from_iter_values(0..num_values as i64)),
+        DataType::Utf8 => {
+            Arc::new(create_string_array_high_cardinality(num_values, 0.05, 0.0))
+        }
+        other => unimplemented!("no generator for {other}"),
+    };
+    let state = Arc::new(ListArray::new(
+        list_field,
+        OffsetBuffer::from_lengths(std::iter::repeat_n(values_per_list, num_groups)),
+        values,
+        None,
+    )) as ArrayRef;
+    let group_indices: Vec<usize> = (0..num_groups).collect();
+
+    c.bench_function(
+        &format!(
+            "array_agg groups merge+evaluate {value_type}, {num_groups} groups, lists of {values_per_list}"
+        ),
+        |b| {
+            b.iter(|| {
+                let mut acc = array_agg.create_groups_accumulator(args.clone()).unwrap();
+                for _ in 0..num_batches {
+                    acc.merge_batch(
+                        std::slice::from_ref(&state),
+                        &group_indices,
+                        num_groups,
+                    )
+                    .unwrap();
+                }
+                black_box(acc.evaluate(EmitTo::All).unwrap())
+            })
+        },
+    );
+}
+
+/// Benchmarks the partial aggregation stage of a grouped `array_agg`: updating
+/// with 8 batches of 8192 rows, then emitting the state. With `clustered`, the
+/// rows of a group are consecutive; otherwise groups are drawn at random.
+fn array_agg_groups_update_evaluate_bench(
+    c: &mut Criterion,
+    num_groups: usize,
+    clustered: bool,
+) {
+    let num_rows = 8192;
+    let schema = Schema::new(vec![Field::new("value", DataType::Int64, true)]);
+    let value_expr = col("value", &schema).unwrap();
+    let value_field = value_expr.return_field(&schema).unwrap();
+    let return_field: FieldRef = Field::new(
+        "array_agg",
+        DataType::List(Field::new_list_field(DataType::Int64, true).into()),
+        true,
+    )
+    .into();
+    let args = AccumulatorArgs {
+        return_field,
+        schema: &schema,
+        expr_fields: std::slice::from_ref(&value_field),
+        ignore_nulls: false,
+        order_bys: &[],
+        is_reversed: false,
+        name: "array_agg(value)",
+        is_distinct: false,
+        exprs: std::slice::from_ref(&value_expr),
+    };
+    let array_agg = ArrayAgg::default();
+
+    let values = Arc::new(Int64Array::from_iter_values(0..num_rows as i64)) as ArrayRef;
+    let mut rng = seedable_rng();
+    let group_indices: Vec<usize> = if clustered {
+        (0..num_rows).map(|i| i * num_groups / num_rows).collect()
+    } else {
+        (0..num_rows)
+            .map(|_| rng.random_range(0..num_groups))
+            .collect()
+    };
+    let layout = if clustered { "clustered" } else { "random" };
+
+    c.bench_function(
+        &format!("array_agg groups update+state Int64, {num_groups} groups, {layout}"),
+        |b| {
+            b.iter(|| {
+                let mut acc = array_agg.create_groups_accumulator(args.clone()).unwrap();
+                for _ in 0..8 {
+                    acc.update_batch(
+                        std::slice::from_ref(&values),
+                        &group_indices,
+                        None,
+                        num_groups,
+                    )
+                    .unwrap();
+                }
+                black_box(acc.state(EmitTo::All).unwrap())
+            })
+        },
+    );
+}
+
+fn array_agg_groups_update_evaluate_benchmark(c: &mut Criterion) {
+    for num_groups in [16, 1024, 8192] {
+        for clustered in [true, false] {
+            array_agg_groups_update_evaluate_bench(c, num_groups, clustered);
+        }
+    }
+}
+
+fn array_agg_groups_merge_evaluate_benchmark(c: &mut Criterion) {
+    for value_type in [DataType::Int64, DataType::Utf8] {
+        for (num_groups, values_per_list) in [
+            (8, 1024),
+            (64, 128),
+            (1024, 8),
+            (2048, 4),
+            (4096, 2),
+            (8192, 1),
+        ] {
+            array_agg_groups_merge_evaluate_bench(
+                c,
+                &value_type,
+                num_groups,
+                values_per_list,
+            );
+        }
+    }
+}
+
 criterion_group!(
     benches,
     array_agg_benchmark,
+    array_agg_groups_merge_evaluate_benchmark,
+    array_agg_groups_update_evaluate_benchmark,
     distinct_array_agg_benchmark,
     distinct_array_agg_groups_benchmark,
     ordered_array_agg_benchmark,
