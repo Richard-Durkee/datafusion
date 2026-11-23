@@ -4,7 +4,7 @@
 
 use std::{
     cmp, fmt,
-    ops::AddAssign,
+    ops::{AddAssign, Range},
     str::FromStr,
     sync::{
         Arc,
@@ -16,6 +16,7 @@ use std::{
 use arrow::array::{ArrayRef, RecordBatch, StringArray};
 use arrow::util::pretty::pretty_format_batches;
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::Utc;
 use datafusion::{
     common::{HashMap, instant::Instant},
@@ -26,8 +27,9 @@ use futures::stream::{BoxStream, Stream};
 use futures::{StreamExt, TryStreamExt};
 use object_store::{
     CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult, Result, path::Path,
+    OBJECT_STORE_COALESCE_DEFAULT, ObjectMeta, ObjectStore, ObjectStoreExt,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, coalesce_ranges,
+    path::Path,
 };
 use parking_lot::{Mutex, RwLock};
 use url::Url;
@@ -401,6 +403,27 @@ impl ObjectStore for InstrumentedObjectStore {
         }
 
         self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+    ) -> Result<Vec<Bytes>> {
+        if self.enabled() {
+            // Record each coalesced range as its own `Get`, like the default
+            // `get_ranges` implementation does through `get_opts`.
+            return coalesce_ranges(
+                ranges,
+                |range| self.get_range(location, range),
+                OBJECT_STORE_COALESCE_DEFAULT,
+            )
+            .await;
+        }
+
+        // Forward to the inner store so it can use its own implementation,
+        // e.g. `LocalFileSystem` opens the file once for all ranges.
+        self.inner.get_ranges(location, ranges).await
     }
 
     fn delete_stream(
