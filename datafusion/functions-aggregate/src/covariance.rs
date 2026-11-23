@@ -4,16 +4,17 @@
 
 //! [`CovarianceSample`]: covariance sample aggregations.
 
-use arrow::array::ArrayRef;
+use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, UInt64Array};
+use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion_common::cast::{as_float64_array, as_uint64_array};
 use datafusion_common::{Result, ScalarValue, not_impl_err};
-use datafusion_expr::DistinctHandling;
 use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Documentation, Signature, Volatility,
     function::{AccumulatorArgs, StateFieldsArgs},
     utils::format_state_name,
 };
+use datafusion_expr::{DistinctHandling, EmitTo, GroupsAccumulator};
 use datafusion_functions_aggregate_common::stats::StatsType;
 use datafusion_macros::user_doc;
 use std::fmt::Debug;
@@ -112,6 +113,22 @@ impl AggregateUDFImpl for CovarianceSample {
         Ok(Box::new(CovarianceAccumulator::try_new(StatsType::Sample)?))
     }
 
+    fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
+        !args.is_distinct
+    }
+
+    fn create_groups_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
+        if args.is_distinct {
+            return not_impl_err!("COVAR_SAMP(DISTINCT) aggregations are not available");
+        }
+        Ok(Box::new(CovarianceGroupsAccumulator::new(
+            StatsType::Sample,
+        )))
+    }
+
     fn aliases(&self) -> &[String] {
         &self.aliases
     }
@@ -204,6 +221,22 @@ impl AggregateUDFImpl for CovariancePopulation {
         )?))
     }
 
+    fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
+        !args.is_distinct
+    }
+
+    fn create_groups_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
+        if args.is_distinct {
+            return not_impl_err!("COVAR_POP(DISTINCT) aggregations are not available");
+        }
+        Ok(Box::new(CovarianceGroupsAccumulator::new(
+            StatsType::Population,
+        )))
+    }
+
     fn documentation(&self) -> Option<&Documentation> {
         self.doc()
     }
@@ -231,49 +264,110 @@ impl AggregateUDFImpl for CovariancePopulation {
 
 #[derive(Debug)]
 pub struct CovarianceAccumulator {
+    state: CovarianceState,
+    stats_type: StatsType,
+}
+
+/// The statistics of one group, shared by [`CovarianceAccumulator`] and
+/// [`CovarianceGroupsAccumulator`].
+#[derive(Debug, Default, Clone, Copy)]
+struct CovarianceState {
     algo_const: f64,
     mean1: f64,
     mean2: f64,
     count: u64,
-    stats_type: StatsType,
+}
+
+impl CovarianceState {
+    /// Adds one row where both values are not NULL.
+    #[inline]
+    fn update(&mut self, value1: f64, value2: f64) {
+        let new_count = self.count + 1;
+        let delta1 = value1 - self.mean1;
+        let new_mean1 = delta1 / new_count as f64 + self.mean1;
+        let delta2 = value2 - self.mean2;
+        let new_mean2 = delta2 / new_count as f64 + self.mean2;
+        let new_c = delta1 * (value2 - new_mean2) + self.algo_const;
+
+        self.count += 1;
+        self.mean1 = new_mean1;
+        self.mean2 = new_mean2;
+        self.algo_const = new_c;
+    }
+
+    /// Merges a partial state with `c` rows into this one.
+    #[inline]
+    fn merge(&mut self, c: u64, mean1: f64, mean2: f64, algo_const: f64) {
+        if c == 0_u64 {
+            return;
+        }
+        let new_count = self.count + c;
+        let new_mean1 = self.mean1 * self.count as f64 / new_count as f64
+            + mean1 * c as f64 / new_count as f64;
+        let new_mean2 = self.mean2 * self.count as f64 / new_count as f64
+            + mean2 * c as f64 / new_count as f64;
+        let delta1 = self.mean1 - mean1;
+        let delta2 = self.mean2 - mean2;
+        let new_c = self.algo_const
+            + algo_const
+            + delta1 * delta2 * self.count as f64 * c as f64 / new_count as f64;
+
+        self.count = new_count;
+        self.mean1 = new_mean1;
+        self.mean2 = new_mean2;
+        self.algo_const = new_c;
+    }
+
+    fn evaluate(&self, stats_type: &StatsType) -> Option<f64> {
+        let count = match stats_type {
+            StatsType::Population => self.count,
+            StatsType::Sample => {
+                if self.count > 0 {
+                    self.count - 1
+                } else {
+                    self.count
+                }
+            }
+        };
+
+        (count != 0).then(|| self.algo_const / count as f64)
+    }
 }
 
 impl CovarianceAccumulator {
     /// Creates a new `CovarianceAccumulator`
     pub fn try_new(s_type: StatsType) -> Result<Self> {
         Ok(Self {
-            algo_const: 0_f64,
-            mean1: 0_f64,
-            mean2: 0_f64,
-            count: 0_u64,
+            state: CovarianceState::default(),
             stats_type: s_type,
         })
     }
 
     pub fn get_count(&self) -> u64 {
-        self.count
+        self.state.count
     }
 
     pub fn get_mean1(&self) -> f64 {
-        self.mean1
+        self.state.mean1
     }
 
     pub fn get_mean2(&self) -> f64 {
-        self.mean2
+        self.state.mean2
     }
 
     pub fn get_algo_const(&self) -> f64 {
-        self.algo_const
+        self.state.algo_const
     }
 }
 
 impl Accumulator for CovarianceAccumulator {
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        let s = &self.state;
         Ok(vec![
-            ScalarValue::from(self.count),
-            ScalarValue::from(self.mean1),
-            ScalarValue::from(self.mean2),
-            ScalarValue::from(self.algo_const),
+            ScalarValue::from(s.count),
+            ScalarValue::from(s.mean1),
+            ScalarValue::from(s.mean2),
+            ScalarValue::from(s.algo_const),
         ])
     }
 
@@ -285,18 +379,7 @@ impl Accumulator for CovarianceAccumulator {
             let (Some(value1), Some(value2)) = (value1, value2) else {
                 continue;
             };
-
-            let new_count = self.count + 1;
-            let delta1 = value1 - self.mean1;
-            let new_mean1 = delta1 / new_count as f64 + self.mean1;
-            let delta2 = value2 - self.mean2;
-            let new_mean2 = delta2 / new_count as f64 + self.mean2;
-            let new_c = delta1 * (value2 - new_mean2) + self.algo_const;
-
-            self.count += 1;
-            self.mean1 = new_mean1;
-            self.mean2 = new_mean2;
-            self.algo_const = new_c;
+            self.state.update(value1, value2);
         }
 
         Ok(())
@@ -305,31 +388,29 @@ impl Accumulator for CovarianceAccumulator {
     fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         let values1 = as_float64_array(&values[0])?;
         let values2 = as_float64_array(&values[1])?;
+        let s = &mut self.state;
 
         for (value1, value2) in values1.iter().zip(values2) {
             let (Some(value1), Some(value2)) = (value1, value2) else {
                 continue;
             };
 
-            if self.count <= 1 {
-                self.count = 0;
-                self.mean1 = 0.0;
-                self.mean2 = 0.0;
-                self.algo_const = 0.0;
+            if s.count <= 1 {
+                *s = CovarianceState::default();
                 continue;
             }
 
-            let new_count = self.count - 1;
-            let delta1 = self.mean1 - value1;
-            let new_mean1 = delta1 / new_count as f64 + self.mean1;
-            let delta2 = self.mean2 - value2;
-            let new_mean2 = delta2 / new_count as f64 + self.mean2;
-            let new_c = self.algo_const - delta1 * (new_mean2 - value2);
+            let new_count = s.count - 1;
+            let delta1 = s.mean1 - value1;
+            let new_mean1 = delta1 / new_count as f64 + s.mean1;
+            let delta2 = s.mean2 - value2;
+            let new_mean2 = delta2 / new_count as f64 + s.mean2;
+            let new_c = s.algo_const - delta1 * (new_mean2 - value2);
 
-            self.count -= 1;
-            self.mean1 = new_mean1;
-            self.mean2 = new_mean2;
-            self.algo_const = new_c;
+            s.count -= 1;
+            s.mean1 = new_mean1;
+            s.mean2 = new_mean2;
+            s.algo_const = new_c;
         }
 
         Ok(())
@@ -342,46 +423,18 @@ impl Accumulator for CovarianceAccumulator {
         let cs = as_float64_array(&states[3])?;
 
         for i in 0..counts.len() {
-            let c = counts.value(i);
-            if c == 0_u64 {
-                continue;
-            }
-            let new_count = self.count + c;
-            let new_mean1 = self.mean1 * self.count as f64 / new_count as f64
-                + means1.value(i) * c as f64 / new_count as f64;
-            let new_mean2 = self.mean2 * self.count as f64 / new_count as f64
-                + means2.value(i) * c as f64 / new_count as f64;
-            let delta1 = self.mean1 - means1.value(i);
-            let delta2 = self.mean2 - means2.value(i);
-            let new_c = self.algo_const
-                + cs.value(i)
-                + delta1 * delta2 * self.count as f64 * c as f64 / new_count as f64;
-
-            self.count = new_count;
-            self.mean1 = new_mean1;
-            self.mean2 = new_mean2;
-            self.algo_const = new_c;
+            self.state.merge(
+                counts.value(i),
+                means1.value(i),
+                means2.value(i),
+                cs.value(i),
+            );
         }
         Ok(())
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        let count = match self.stats_type {
-            StatsType::Population => self.count,
-            StatsType::Sample => {
-                if self.count > 0 {
-                    self.count - 1
-                } else {
-                    self.count
-                }
-            }
-        };
-
-        if count == 0 {
-            Ok(ScalarValue::Float64(None))
-        } else {
-            Ok(ScalarValue::Float64(Some(self.algo_const / count as f64)))
-        }
+        Ok(ScalarValue::Float64(self.state.evaluate(&self.stats_type)))
     }
 
     fn size(&self) -> usize {
@@ -390,5 +443,236 @@ impl Accumulator for CovarianceAccumulator {
 
     fn supports_retract_batch(&self) -> bool {
         true
+    }
+}
+
+/// [`GroupsAccumulator`] for `covar_samp` and `covar_pop`: one
+/// [`CovarianceState`] per group, updated with the same arithmetic as
+/// [`CovarianceAccumulator`].
+#[derive(Debug)]
+struct CovarianceGroupsAccumulator {
+    states: Vec<CovarianceState>,
+    stats_type: StatsType,
+}
+
+impl CovarianceGroupsAccumulator {
+    fn new(stats_type: StatsType) -> Self {
+        Self {
+            states: vec![],
+            stats_type,
+        }
+    }
+}
+
+/// The state columns, in the order of `state_fields`.
+fn states_to_arrays(states: &[CovarianceState]) -> Vec<ArrayRef> {
+    let column = |f: fn(&CovarianceState) -> f64| -> ArrayRef {
+        Arc::new(Float64Array::from_iter_values(states.iter().map(f)))
+    };
+    vec![
+        Arc::new(UInt64Array::from_iter_values(
+            states.iter().map(|s| s.count),
+        )),
+        column(|s| s.mean1),
+        column(|s| s.mean2),
+        column(|s| s.algo_const),
+    ]
+}
+
+/// Rows where both values and the filter are valid and the filter is true,
+/// or `None` when every row is.
+fn valid_rows(
+    values1: &Float64Array,
+    values2: &Float64Array,
+    opt_filter: Option<&BooleanArray>,
+) -> Option<BooleanBuffer> {
+    let valid = arrow::buffer::NullBuffer::union(values1.nulls(), values2.nulls());
+    let filter = opt_filter.map(|filter| match filter.nulls() {
+        Some(nulls) => filter.values() & nulls.inner(),
+        None => filter.values().clone(),
+    });
+    match (valid, filter) {
+        (None, None) => None,
+        (Some(valid), None) => Some(valid.into_inner()),
+        (None, Some(filter)) => Some(filter),
+        (Some(valid), Some(filter)) => Some(valid.inner() & &filter),
+    }
+}
+
+impl GroupsAccumulator for CovarianceGroupsAccumulator {
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        self.states
+            .resize(total_num_groups, CovarianceState::default());
+        let values1 = as_float64_array(&values[0])?;
+        let values2 = as_float64_array(&values[1])?;
+        let (v1, v2) = (values1.values(), values2.values());
+        match valid_rows(values1, values2, opt_filter) {
+            None => {
+                for (row, &group) in group_indices.iter().enumerate() {
+                    self.states[group].update(v1[row], v2[row]);
+                }
+            }
+            Some(valid) => {
+                for row in valid.set_indices() {
+                    self.states[group_indices[row]].update(v1[row], v2[row]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        total_num_groups: usize,
+    ) -> Result<()> {
+        self.states
+            .resize(total_num_groups, CovarianceState::default());
+        let counts = as_uint64_array(&values[0])?;
+        let means1 = as_float64_array(&values[1])?;
+        let means2 = as_float64_array(&values[2])?;
+        let cs = as_float64_array(&values[3])?;
+        for (row, &group) in group_indices.iter().enumerate() {
+            self.states[group].merge(
+                counts.value(row),
+                means1.value(row),
+                means2.value(row),
+                cs.value(row),
+            );
+        }
+        Ok(())
+    }
+
+    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        let states = emit_to.take_needed(&mut self.states);
+        Ok(Arc::new(Float64Array::from_iter(
+            states.iter().map(|s| s.evaluate(&self.stats_type)),
+        )))
+    }
+
+    fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        let states = emit_to.take_needed(&mut self.states);
+        Ok(states_to_arrays(&states))
+    }
+
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        opt_filter: Option<&BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
+        let values1 = as_float64_array(&values[0])?;
+        let values2 = as_float64_array(&values[1])?;
+        let valid = valid_rows(values1, values2, opt_filter);
+        let (v1, v2) = (values1.values(), values2.values());
+        // Each valid row is a group with that one row; others stay empty,
+        // which `merge` skips.
+        let states: Vec<CovarianceState> = (0..values1.len())
+            .map(|row| {
+                let mut state = CovarianceState::default();
+                if valid.as_ref().is_none_or(|v| v.value(row)) {
+                    state.update(v1[row], v2[row]);
+                }
+                state
+            })
+            .collect();
+        Ok(states_to_arrays(&states))
+    }
+
+    fn size(&self) -> usize {
+        self.states.capacity() * size_of::<CovarianceState>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion_functions_aggregate_common::aggregate::groups_accumulator::GroupsAccumulatorAdapter;
+
+    type Batch = (Vec<ArrayRef>, Vec<usize>, BooleanArray);
+
+    /// Batches with NULLs in both columns and the filter, and a group with
+    /// a single row.
+    fn batches() -> Vec<Batch> {
+        (0..4)
+            .map(|b| {
+                let n = 200;
+                let col = |m: usize, k: usize| -> ArrayRef {
+                    Arc::new(Float64Array::from(
+                        (0..n)
+                            .map(|i| {
+                                ((i + b) % m != 0)
+                                    .then_some(((i * k + b) % 97) as f64 / 7.0)
+                            })
+                            .collect::<Vec<_>>(),
+                    ))
+                };
+                let groups = (0..n)
+                    .map(|i| if i == 5 { 9 } else { (i * 13 + b) % 9 })
+                    .collect();
+                let filter = (0..n)
+                    .map(|i| (i % 19 != 0).then_some(i % 7 != 0))
+                    .collect();
+                (vec![col(11, 37), col(13, 17)], groups, filter)
+            })
+            .collect()
+    }
+
+    fn run(
+        acc: &mut dyn GroupsAccumulator,
+        partial: &mut dyn GroupsAccumulator,
+    ) -> Result<Vec<Option<u64>>> {
+        let batches = batches();
+        let num_groups = 10;
+        for (values, groups, filter) in &batches[..2] {
+            acc.update_batch(values, groups, Some(filter), num_groups)?;
+        }
+        let (values, groups, filter) = &batches[2];
+        partial.update_batch(values, groups, Some(filter), num_groups)?;
+        let all_groups: Vec<usize> = (0..num_groups).collect();
+        acc.merge_batch(&partial.state(EmitTo::All)?, &all_groups, num_groups)?;
+        let (values, groups, filter) = &batches[3];
+        acc.merge_batch(
+            &partial.convert_to_state(values, Some(filter))?,
+            groups,
+            num_groups,
+        )?;
+        let mut out = vec![];
+        for emit in [EmitTo::First(4), EmitTo::All] {
+            let array = acc.evaluate(emit)?;
+            out.extend(
+                array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.map(f64::to_bits)),
+            );
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn groups_accumulator_matches_row_accumulator() -> Result<()> {
+        for stats_type in [StatsType::Sample, StatsType::Population] {
+            let adapter = || {
+                GroupsAccumulatorAdapter::new(move || {
+                    Ok(Box::new(CovarianceAccumulator::try_new(stats_type)?))
+                })
+            };
+            let expected = run(&mut adapter(), &mut adapter())?;
+            let actual = run(
+                &mut CovarianceGroupsAccumulator::new(stats_type),
+                &mut CovarianceGroupsAccumulator::new(stats_type),
+            )?;
+            assert_eq!(actual, expected, "{stats_type:?}");
+        }
+        Ok(())
     }
 }
