@@ -8,6 +8,11 @@
 ##########
 
 # File1 has only columns a and b
+# These tests exercise filter pushdown with predicates that the statistics
+# prove true for every row, so keep those predicates.
+statement ok
+set datafusion.optimizer.drop_always_true_filter_predicates = false;
+
 statement ok
 COPY  (
   SELECT column1 as a, column2 as b
@@ -1173,3 +1178,6 @@ NULL
 
 statement ok
 DROP TABLE struct_with_map;
+
+statement ok
+RESET datafusion.optimizer.drop_always_true_filter_predicates;

@@ -7,6 +7,11 @@
 # the option is wired through from config to the writer.
 # See datafusion/common/src/config.rs for the option definition.
 
+# These tests exercise filter pushdown with predicates that the statistics
+# prove true for every row, so keep those predicates.
+statement ok
+set datafusion.optimizer.drop_always_true_filter_predicates = false;
+
 statement ok
 CREATE TABLE source_table(id INT, name VARCHAR) AS VALUES
 (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five');
@@ -171,3 +176,6 @@ reset datafusion.execution.minimum_parallel_output_files;
 
 statement ok
 set datafusion.execution.target_partitions = 4;
+
+statement ok
+RESET datafusion.optimizer.drop_always_true_filter_predicates;

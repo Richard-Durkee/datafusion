@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+# Conjuncts that the exact statistics of a scan prove true for every row are
+# dropped before filter pushdown.
+
+# `a` ranges over 1..6 with no NULLs, though its field is nullable. `b` has a
+# NULL.
+query I
+COPY (SELECT column1 AS a, column2 AS b, column3 AS c
+      FROM (VALUES (1, 10, 'x'), (2, NULL, 'y'), (3, 30, 'z')))
+TO 'test_files/scratch/filter_always_true_by_statistics/t/0.parquet'
+STORED AS PARQUET;
+----
+3
+
+query I
+COPY (SELECT column1 AS a, column2 AS b, column3 AS c
+      FROM (VALUES (4, 40, 'x'), (5, 50, 'y'), (6, 60, 'z')))
+TO 'test_files/scratch/filter_always_true_by_statistics/t/1.parquet'
+STORED AS PARQUET;
+----
+3
+
+statement ok
+CREATE EXTERNAL TABLE t
+STORED AS PARQUET
+LOCATION 'test_files/scratch/filter_always_true_by_statistics/t';
+
+statement ok
+set datafusion.explain.physical_plan_only = true;
+
+statement ok
+set datafusion.execution.target_partitions = 1;
+
+# Every conjunct is always true: the filter is removed.
+query TT
+EXPLAIN SELECT count(*) FROM t WHERE a > 0 AND a <= 6;
+----
+physical_plan
+01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
+02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1))]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_always_true_by_statistics/t/0.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_always_true_by_statistics/t/1.parquet]]}, file_type=parquet, predicate=true
+
+query I
+SELECT count(*) FROM t WHERE a > 0 AND a <= 6;
+----
+6
+
+# The always true conjunct is dropped, and the scan no longer reads `a`.
+query TT
+EXPLAIN SELECT c FROM t WHERE a >= 1 AND c = 'y';
+----
+physical_plan
+01)FilterExec: c@0 = y
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_always_true_by_statistics/t/0.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_always_true_by_statistics/t/1.parquet]]}, projection=[c], file_type=parquet, predicate=c@2 = y, pruning_predicate=c_null_count@2 != row_count@3 AND c_min@0 <= y AND y <= c_max@1, required_guarantees=[c in (y)]
+
+query T rowsort
+SELECT c FROM t WHERE a >= 1 AND c = 'y';
+----
+y
+y
+
+# `b > 0` holds for every non-NULL value, but filters out the NULL row, so
+# it stays.
+query TT
+EXPLAIN SELECT count(*) FROM t WHERE b > 0;
+----
+physical_plan
+01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
+02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1))]
+03)----FilterExec: b@0 > 0, projection=[]
+04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_always_true_by_statistics/t/0.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_always_true_by_statistics/t/1.parquet]]}, projection=[b], file_type=parquet, predicate=b@1 > 0, pruning_predicate=b_null_count@1 != row_count@2 AND b_max@0 > 0, required_guarantees=[]
+
+query I
+SELECT count(*) FROM t WHERE b > 0;
+----
+5
+
+# The listing table already skips 0.parquet, where `a` is at most 3, so `a > 3`
+# holds for every row it reads and is dropped. `a > 4` is not, and stays.
+query TT
+EXPLAIN SELECT count(*) FROM t WHERE a > 3;
+----
+physical_plan
+01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
+02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1))]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_always_true_by_statistics/t/1.parquet]]}, file_type=parquet, predicate=true
+
+query TT
+EXPLAIN SELECT count(*) FROM t WHERE a > 4;
+----
+physical_plan
+01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
+02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1))]
+03)----FilterExec: a@0 > 4, projection=[]
+04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_always_true_by_statistics/t/1.parquet]]}, projection=[a], file_type=parquet, predicate=a@0 > 4, pruning_predicate=a_null_count@1 != row_count@2 AND a_max@0 > 4, required_guarantees=[]
+
+query I
+SELECT count(*) FROM t WHERE a > 4;
+----
+2
+
+# Casts can turn values into NULL (`TRY_CAST`) or fail (`CAST`), which the
+# statistics cannot show, so conjuncts with casts stay.
+query TT
+EXPLAIN SELECT count(*) FROM t WHERE CAST(a AS VARCHAR) >= '1';
+----
+physical_plan
+01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
+02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1))]
+03)----FilterExec: CAST(a@0 AS Utf8View) >= 1, projection=[]
+04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_always_true_by_statistics/t/0.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_always_true_by_statistics/t/1.parquet]]}, projection=[a], file_type=parquet, predicate=CAST(a@0 AS Utf8View) >= 1
+
+statement ok
+DROP TABLE t;
+
+# The SLT runner sets `target_partitions` to 4 instead of using the default, so
+# restore that value rather than RESET.
+statement ok
+SET datafusion.execution.target_partitions = 4;
+
+statement ok
+RESET datafusion.explain.physical_plan_only;

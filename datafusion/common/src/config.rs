@@ -1735,6 +1735,12 @@ config_namespace! {
         /// predicate push down.
         pub filter_null_join_keys: bool, default = false
 
+        /// When set to true, the optimizer removes the conjuncts of a filter
+        /// directly above a scan that the scan's exact statistics prove true
+        /// for every row, such as `x > 0` when the minimum of `x` is 1 and it
+        /// has no NULLs. Only comparisons of columns and literals qualify.
+        pub drop_always_true_filter_predicates: bool, default = true
+
         /// Should DataFusion repartition data using the aggregate keys to execute aggregates
         /// in parallel using the provided `target_partitions` level
         pub repartition_aggregations: bool, default = true

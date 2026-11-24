@@ -4,6 +4,11 @@
 
 # Test push down filter
 
+# These tests exercise filter pushdown with predicates that the statistics
+# prove true for every row, so keep those predicates.
+statement ok
+set datafusion.optimizer.drop_always_true_filter_predicates = false;
+
 statement ok
 set datafusion.explain.physical_plan_only = true;
 
@@ -1722,3 +1727,6 @@ DROP TABLE cast_order;
 
 statement ok
 DROP TABLE cast_order_src;
+
+statement ok
+RESET datafusion.optimizer.drop_always_true_filter_predicates;

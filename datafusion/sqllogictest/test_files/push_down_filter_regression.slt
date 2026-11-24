@@ -6,6 +6,11 @@
 
 # Regression test for https://github.com/apache/datafusion/issues/26545
 # Pushing the filter below COUNT(*) would return one row containing zero.
+# These tests exercise filter pushdown with predicates that the statistics
+# prove true for every row, so keep those predicates.
+statement ok
+set datafusion.optimizer.drop_always_true_filter_predicates = false;
+
 query I
 SELECT c FROM (
   SELECT 'all' AS k, COUNT(*) AS c FROM (VALUES (1)) AS t(a)
@@ -1053,3 +1058,6 @@ drop table window_ab;
 
 statement ok
 set datafusion.explain.logical_plan_only = false;
+
+statement ok
+RESET datafusion.optimizer.drop_always_true_filter_predicates;

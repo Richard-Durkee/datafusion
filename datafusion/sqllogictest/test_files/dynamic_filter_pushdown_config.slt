@@ -9,6 +9,11 @@
 # - enable_dynamic_filter_pushdown (controls all three)
 
 # Setup: Create parquet test files
+# These tests exercise filter pushdown with predicates that the statistics
+# prove true for every row, so keep those predicates.
+statement ok
+set datafusion.optimizer.drop_always_true_filter_predicates = false;
+
 statement ok
 CREATE TABLE test_data(id INT, value INT, name VARCHAR) AS VALUES
 (1, 100, 'a'),
@@ -1298,3 +1303,6 @@ RESET datafusion.execution.parquet.pushdown_filters;
 
 statement ok
 RESET datafusion.explain.physical_plan_only;
+
+statement ok
+RESET datafusion.optimizer.drop_always_true_filter_predicates;

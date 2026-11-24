@@ -22,15 +22,32 @@ use std::sync::Arc;
 
 use crate::PhysicalOptimizerRule;
 
+use arrow::datatypes::SchemaRef;
+use datafusion_common::pruning::PrunableStatistics;
+use datafusion_common::stats::Precision;
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Result, assert_eq_or_internal_err, config::ConfigOptions};
+use datafusion_expr::Operator;
 use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, InListExpr, IsNotNullExpr, IsNullExpr, Literal, NotExpr,
+};
+use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
+use datafusion_physical_expr::utils::{
+    collect_columns, conjunction, reassign_expr_columns, split_conjunction,
+};
 use datafusion_physical_expr_common::physical_expr::is_volatile;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::execution_plan::replace_children_if_necessary;
+use datafusion_physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion_physical_plan::filter_pushdown::{
     ChildFilterPushdownResult, ChildPushdownResult, FilterPushdownPhase,
     FilterPushdownPropagation, PushedDown,
 };
+use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+use datafusion_pruning::PruningPredicateBuilder;
 
 use itertools::{Itertools, izip};
 
@@ -408,6 +425,15 @@ impl PhysicalOptimizerRule for FilterPushdown {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Before any filter reaches a scan, whose statistics then become
+        // inexact, drop the conjuncts that the exact statistics prove true.
+        let plan = if self.phase == FilterPushdownPhase::Pre
+            && config.optimizer.drop_always_true_filter_predicates
+        {
+            drop_always_true_conjuncts(plan)?
+        } else {
+            plan
+        };
         Ok(
             push_down_filters(&Arc::clone(&plan), vec![], config, self.phase)?
                 .updated_node
@@ -703,6 +729,187 @@ impl<T: Clone> FilteredVec<T> {
 
 fn allow_pushdown_for_expr(expr: &Arc<dyn PhysicalExpr>) -> bool {
     !is_volatile(expr)
+}
+
+/// Removes the conjuncts of a [`FilterExec`] directly above a leaf (such as a
+/// scan) that the leaf's exact statistics prove `true` for every row.
+///
+/// A conjunct is always true when no row can make it `false` or `NULL`: the
+/// pruning predicate for `NOT conjunct OR col IS NULL` (one `IS NULL` per
+/// nullable column it reads) prunes the whole input, as for fully matched
+/// Parquet row groups. Only exact statistics are used, and volatile conjuncts
+/// are kept. A filter left with no conjuncts has the predicate `true`, which
+/// filter pushdown then removes.
+fn drop_always_true_conjuncts(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_up(|node| {
+        let Some(filter) = node.downcast_ref::<FilterExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        let input = filter.input();
+        if !input.children().is_empty() {
+            return Ok(Transformed::no(node));
+        }
+        let conjuncts = split_conjunction(filter.predicate());
+        let schema = input.schema();
+        let statistics =
+            StatisticsContext::new().compute(input.as_ref(), &StatisticsArgs::new())?;
+        // Every conjunct is vacuously true without rows; nothing to gain there.
+        if !matches!(statistics.num_rows, Precision::Exact(n) if n > 0) {
+            return Ok(Transformed::no(node));
+        }
+        let statistics = PrunableStatistics::new(vec![statistics], Arc::clone(&schema));
+        let kept: Vec<_> = conjuncts
+            .iter()
+            .filter(|conjunct| !is_always_true(conjunct, &schema, &statistics))
+            .map(|conjunct| Arc::clone(conjunct))
+            .collect();
+        if kept.len() == conjuncts.len() {
+            return Ok(Transformed::no(node));
+        }
+        let predicate = conjunction(kept);
+        let filter = match narrow_input(filter, &predicate)? {
+            Some(filter) => filter,
+            None => FilterExecBuilder::from(filter)
+                .with_predicate(predicate)
+                .build()?,
+        };
+        Ok(Transformed::yes(Arc::new(filter) as Arc<dyn ExecutionPlan>))
+    })
+    .data()
+}
+
+/// Rebuilds `filter` with `predicate` over a version of its input that only
+/// produces the columns the filter still reads or outputs, if the input
+/// supports that. Without this, a scan would keep reading the columns that
+/// only the dropped conjuncts used.
+fn narrow_input(
+    filter: &FilterExec,
+    predicate: &Arc<dyn PhysicalExpr>,
+) -> Result<Option<FilterExec>> {
+    // Without a projection the filter outputs every input column.
+    let Some(projection) = filter.projection() else {
+        return Ok(None);
+    };
+    let input = filter.input();
+    let input_schema = input.schema();
+    // The columns are matched up by name below.
+    if !input_schema.fields().iter().map(|f| f.name()).all_unique() {
+        return Ok(None);
+    }
+    let needed: std::collections::BTreeSet<usize> = projection
+        .iter()
+        .copied()
+        .chain(collect_columns(predicate).iter().map(|c| c.index()))
+        .collect();
+    if needed.len() == input_schema.fields().len() {
+        return Ok(None);
+    }
+    let exprs = needed.iter().map(|&i| {
+        let name = input_schema.field(i).name().clone();
+        (
+            Arc::new(Column::new(&name, i)) as Arc<dyn PhysicalExpr>,
+            name,
+        )
+    });
+    let narrowing = ProjectionExec::try_new(exprs, Arc::clone(input))?;
+    let Some(narrowed) = input.try_swapping_with_projection(&narrowing)? else {
+        return Ok(None);
+    };
+    let narrowed_schema = narrowed.schema();
+    // Columns keep their names, so look up their new positions by name.
+    let Ok(predicate) = reassign_expr_columns(Arc::clone(predicate), &narrowed_schema)
+    else {
+        return Ok(None);
+    };
+    let Ok(projection) = projection
+        .iter()
+        .map(|&i| narrowed_schema.index_of(input_schema.field(i).name()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        FilterExecBuilder::from(filter)
+            .with_input(narrowed)
+            .with_predicate(predicate)
+            .apply_projection(None)?
+            .apply_projection(Some(projection))?
+            .build()?,
+    ))
+}
+
+/// Whether `expr` only compares columns and literals. Casts are excluded:
+/// `TRY_CAST` can turn a value into `NULL` and `CAST` can fail, and the
+/// statistics cannot show either.
+fn only_plain_comparisons(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    let plain = if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
+        matches!(
+            binary.op(),
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+                | Operator::IsDistinctFrom
+                | Operator::IsNotDistinctFrom
+                | Operator::And
+                | Operator::Or
+        )
+    } else {
+        expr.is::<Column>()
+            || expr.is::<Literal>()
+            || expr.is::<NotExpr>()
+            || expr.is::<IsNullExpr>()
+            || expr.is::<IsNotNullExpr>()
+            || expr.is::<InListExpr>()
+    };
+    plain && expr.children().into_iter().all(only_plain_comparisons)
+}
+
+fn is_always_true(
+    conjunct: &Arc<dyn PhysicalExpr>,
+    schema: &SchemaRef,
+    statistics: &PrunableStatistics,
+) -> bool {
+    if is_volatile(conjunct) || !only_plain_comparisons(conjunct) {
+        return false;
+    }
+    let build = |expr| {
+        PruningPredicateBuilder::new()
+            .with_file_schema(Arc::clone(schema))
+            .try_build(expr)
+            .ok()
+    };
+    let Some(predicate) = build(Arc::clone(conjunct)) else {
+        return false;
+    };
+    if !predicate.can_be_inverted_for_full_match() {
+        return false;
+    }
+    let mut inverted: Arc<dyn PhysicalExpr> =
+        Arc::new(NotExpr::new(Arc::clone(conjunct)));
+    for column in collect_columns(conjunct)
+        .into_iter()
+        .sorted_by_key(|c| c.index())
+        .filter(|c| schema.field(c.index()).is_nullable())
+    {
+        inverted = Arc::new(BinaryExpr::new(
+            inverted,
+            Operator::Or,
+            Arc::new(IsNullExpr::new(Arc::new(column))),
+        ));
+    }
+    let Ok(inverted) = PhysicalExprSimplifier::new(schema).simplify(inverted) else {
+        return false;
+    };
+    let Some(inverted) = build(inverted) else {
+        return false;
+    };
+    // `false` means no row can satisfy the inverse.
+    matches!(inverted.prune(statistics).as_deref(), Ok([false]))
 }
 
 #[cfg(test)]
