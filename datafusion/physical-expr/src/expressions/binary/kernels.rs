@@ -5,18 +5,22 @@
 //! This module contains computation kernels that are specific to
 //! datafusion and not (yet) targeted to  port upstream to arrow
 use arrow::array::*;
+use arrow::buffer::BooleanBuffer;
 use arrow::compute::kernels::bitwise::{
     bitwise_and, bitwise_and_scalar, bitwise_or, bitwise_or_scalar, bitwise_shift_left,
     bitwise_shift_left_scalar, bitwise_shift_right, bitwise_shift_right_scalar,
     bitwise_xor, bitwise_xor_scalar,
 };
 use arrow::compute::kernels::boolean::not;
-use arrow::compute::kernels::comparison::{regexp_is_match, regexp_is_match_scalar};
+use arrow::compute::kernels::comparison::regexp_is_match;
 use arrow::datatypes::DataType;
+use arrow::error::ArrowError;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_common::{exec_err, internal_err, plan_err};
 use datafusion_physical_expr_common::regex::explain_regexp_kernel_error;
 
+use regex::Regex;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 /// Downcasts $LEFT and $RIGHT to $ARRAY_TYPE and then calls $KERNEL($LEFT, $RIGHT)
@@ -224,6 +228,61 @@ pub(crate) fn regex_match_dyn(
     }
 }
 
+/// How many compiled scalar patterns each thread keeps, see [`regexp_is_match_scalar`]
+const REGEX_CACHE_SIZE: usize = 8;
+
+thread_local! {
+    /// Compiled scalar patterns of `~`, `~*`, `!~` and `!~*`, oldest first.
+    static REGEX_CACHE: RefCell<Vec<(String, Regex)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Like arrow's `regexp_is_match_scalar`, but reuses the compiled pattern.
+///
+/// The arrow kernel compiles the pattern on every call, which is once per batch. That can cost
+/// more than the match itself when the batches are small, for example after an `AND` filtered
+/// the batch down to the rows its earlier conjuncts kept. We keep the compiled patterns per
+/// thread instead of sharing one `Regex`, since a `Regex` used from several threads takes a
+/// lock on every match.
+fn regexp_is_match_scalar<'a, S>(
+    array: &'a S,
+    regex: &str,
+    flag: Option<&str>,
+) -> Result<BooleanArray, ArrowError>
+where
+    &'a S: StringArrayType<'a>,
+{
+    let pattern = match flag {
+        Some(flag) => format!("(?{flag}){regex}"),
+        None => regex.to_string(),
+    };
+    let values = if pattern.is_empty() {
+        BooleanBuffer::new_set(array.len())
+    } else {
+        REGEX_CACHE.with_borrow_mut(|cache| {
+            let i = match cache.iter().position(|(p, _)| *p == pattern) {
+                Some(i) => i,
+                None => {
+                    let re = Regex::new(&pattern).map_err(|e| {
+                        ArrowError::ComputeError(format!(
+                            "Regular expression did not compile: {e:?}"
+                        ))
+                    })?;
+                    if cache.len() == REGEX_CACHE_SIZE {
+                        cache.remove(0);
+                    }
+                    cache.push((pattern, re));
+                    cache.len() - 1
+                }
+            };
+            let re = &cache[i].1;
+            Ok::<_, ArrowError>(BooleanBuffer::collect_bool(array.len(), |i| {
+                re.is_match(array.value(i))
+            }))
+        })?
+    };
+    Ok(BooleanArray::new(values, array.nulls().cloned()))
+}
+
 /// Invoke a compute kernel on a data array and a scalar value with flag
 macro_rules! regexp_is_match_flag_scalar {
     ($LEFT:expr, $RIGHT:expr, $ARRAYTYPE:ident, $NOT:expr, $FLAG:expr) => {{
@@ -313,4 +372,55 @@ pub(crate) fn regex_match_dyn_scalar(
         ),
     };
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::compute::kernels::comparison::regexp_is_match_scalar as arrow_kernel;
+
+    #[test]
+    fn cached_regexp_is_match_scalar_matches_arrow() {
+        let values = StringArray::from(vec![
+            Some("foo"),
+            None,
+            Some("Foobar"),
+            Some("barfoo"),
+            Some(""),
+            Some("special requests"),
+        ]);
+        let sliced = values.slice(1, 4);
+        // More patterns than the cache holds, used twice, so later uses hit
+        // both cached and evicted entries
+        let patterns: Vec<String> = ["^foo", "foo$", "", "special.*requests", "o+b"]
+            .into_iter()
+            .map(String::from)
+            .chain((0..REGEX_CACHE_SIZE).map(|i| format!("x{i}")))
+            .collect();
+        for _ in 0..2 {
+            for pattern in &patterns {
+                for flag in [None, Some("i")] {
+                    for array in [&values, &sliced] {
+                        assert_eq!(
+                            regexp_is_match_scalar(array, pattern, flag).unwrap(),
+                            arrow_kernel(array, pattern, flag).unwrap(),
+                            "{pattern} {flag:?}"
+                        );
+                    }
+                }
+            }
+        }
+        let view = StringViewArray::from_iter(values.iter());
+        assert_eq!(
+            regexp_is_match_scalar(&view, "^foo", Some("i")).unwrap(),
+            arrow_kernel(&view, "^foo", Some("i")).unwrap()
+        );
+        for _ in 0..2 {
+            let error = regexp_is_match_scalar(&values, "(", None).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                arrow_kernel(&values, "(", None).unwrap_err().to_string()
+            );
+        }
+    }
 }
