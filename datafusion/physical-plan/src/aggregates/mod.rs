@@ -1368,10 +1368,12 @@ impl AggregateExec {
             )?));
         }
 
-        // Grouping sets are expanded by the raw-input stages, so the stages
-        // consuming partial state must receive the expanded keys as a plain
-        // group by (see `PhysicalGroupBy::as_final`).
+        // Grouping sets are expanded by the raw-input stages, or by a
+        // `PartialReduce` over a plain group by of all the grouping
+        // expressions. The final stages must receive the expanded keys as a
+        // plain group by (see `PhysicalGroupBy::as_final`).
         if self.mode.input_mode() == AggregateInputMode::Partial
+            && self.mode != PartialReduce
             && !self.group_by().is_single()
         {
             return internal_err!(
@@ -2132,6 +2134,21 @@ impl ExecutionPlan for AggregateExec {
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
         self.input_distribution_requirements().into_per_child()
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // A `PartialReduce` that expands grouping sets runs right above the
+        // aggregate that feeds it, which already ran with the input's
+        // parallelism. Spreading the much smaller set of groups across more
+        // partitions would only add a shuffle.
+        let expands_grouping_sets = self.mode == AggregateMode::PartialReduce
+            && self.group_by().has_grouping_set();
+        self.input_distribution_requirements()
+            .per_child_distributions()
+            .map(|dist| {
+                !expands_grouping_sets && !matches!(dist, Distribution::SinglePartition)
+            })
+            .collect()
     }
 
     fn input_distribution_requirements(&self) -> InputDistributionRequirements {

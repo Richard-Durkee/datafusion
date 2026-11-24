@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+##########
+# GROUPING SETS, ROLLUP and CUBE aggregate the input once by all the grouping
+# expressions, then expand those groups into each grouping set with a
+# `PartialReduce` aggregate.
+##########
+
+# `b` holds a NULL in the data, which must stay apart from the NULL that
+# marks `b` as rolled up.
+statement ok
+create table t(a varchar, b int, v int) as values
+  ('x', 1, 10),
+  ('x', 1, 20),
+  ('x', 2, 30),
+  ('x', null, 40),
+  ('y', 1, 50),
+  ('y', 3, null),
+  (null, 1, 60);
+
+query TT
+explain select a, b, sum(v) from t group by rollup(a, b);
+----
+logical_plan
+01)Projection: t.a, t.b, sum(t.v)
+02)--Aggregate: groupBy=[[ROLLUP (t.a, t.b)]], aggr=[[sum(CAST(t.v AS Int64))]]
+03)----TableScan: t projection=[a, b, v]
+physical_plan
+01)ProjectionExec: expr=[a@0 as a, b@1 as b, sum(t.v)@3 as sum(t.v)]
+02)--AggregateExec: mode=FinalPartitioned, gby=[a@0 as a, b@1 as b, __grouping_id@2 as __grouping_id], aggr=[sum(t.v)]
+03)----RepartitionExec: partitioning=Hash([a@0, b@1, __grouping_id@2], 4), input_partitions=1
+04)------AggregateExec: mode=PartialReduce, gby=[(NULL as a, NULL as b), (a@0 as a, NULL as b), (a@0 as a, b@1 as b)], aggr=[sum(t.v)]
+05)--------AggregateExec: mode=Partial, gby=[a@0 as a, b@1 as b], aggr=[sum(t.v)]
+06)----------DataSourceExec: partitions=1, partition_sizes=[1]
+
+query TIIIRIII
+select a, b, sum(v), count(v), avg(v), count(distinct b), grouping(a), grouping(b)
+from t group by rollup(a, b)
+order by grouping(a), grouping(b), a, b;
+----
+x 1 30 2 15 1 0 0
+x 2 30 1 30 1 0 0
+x NULL 40 1 40 0 0 0
+y 1 50 1 50 1 0 0
+y 3 NULL 0 NULL 1 0 0
+NULL 1 60 1 60 1 0 0
+x NULL 100 4 25 2 0 1
+y NULL 50 1 50 2 0 1
+NULL NULL 60 1 60 1 0 1
+NULL NULL 210 6 35 3 1 1
+
+query TIII
+select a, b, sum(v), grouping(a, b)
+from t group by cube(a, b)
+order by grouping(a, b), a, b;
+----
+x 1 30 0
+x 2 30 0
+x NULL 40 0
+y 1 50 0
+y 3 NULL 0
+NULL 1 60 0
+x NULL 100 1
+y NULL 50 1
+NULL NULL 60 1
+NULL 1 140 2
+NULL 2 30 2
+NULL 3 NULL 2
+NULL NULL 40 2
+NULL NULL 210 3
+
+# Group expressions are evaluated once, by the first aggregate.
+query TII
+select upper(a) as ua, b + 1 as b1, sum(v)
+from t group by grouping sets ((upper(a)), (b + 1))
+order by ua, b1, sum(v);
+----
+X NULL 100
+Y NULL 50
+NULL 2 140
+NULL 3 30
+NULL 4 NULL
+NULL NULL 40
+NULL NULL 60
+
+# Empty input still yields the grand total row.
+query TII
+select a, b, sum(v) from t where v > 1000 group by rollup(a, b);
+----
+NULL NULL NULL
+
+statement ok
+drop table t;

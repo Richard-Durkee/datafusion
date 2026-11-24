@@ -60,6 +60,10 @@ impl AggregateHashTable<PartialReduceMarker> {
     }
 
     pub(in crate::aggregates) fn start_output(&mut self) -> Result<()> {
+        self.init_empty_grouping_sets(
+            HashAggregateAccumulator::merge_batch,
+            AccumulatorPhase::Merge,
+        )?;
         self.start_outputting();
         Ok(())
     }

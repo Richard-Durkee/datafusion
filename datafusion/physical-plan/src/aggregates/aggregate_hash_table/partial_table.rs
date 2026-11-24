@@ -106,7 +106,10 @@ impl AggregateHashTable<PartialMarker> {
     }
 
     pub(in crate::aggregates) fn start_output(&mut self) -> Result<()> {
-        self.init_empty_grouping_sets()?;
+        self.init_empty_grouping_sets(
+            HashAggregateAccumulator::update_batch,
+            AccumulatorPhase::Update,
+        )?;
         self.start_outputting();
         Ok(())
     }

@@ -90,7 +90,7 @@ use datafusion_expr::{
 use datafusion_physical_expr::aggregate::{
     AggregateFunctionExpr, LoweredAggregate, LoweredAggregateBuilder,
 };
-use datafusion_physical_expr::expressions::Literal;
+use datafusion_physical_expr::expressions::{Column as PhysicalColumn, Literal};
 use datafusion_physical_expr::{
     LexOrdering, PhysicalSortExpr, create_physical_sort_exprs,
 };
@@ -2286,14 +2286,67 @@ impl DefaultPhysicalPlanner {
             input_exec
         };
 
-        let initial_aggr = Arc::new(AggregateExec::try_new(
-            AggregateMode::Partial,
-            groups.clone(),
-            aggregates,
-            filters.clone(),
-            input_exec,
-            Arc::clone(&physical_input_schema),
-        )?);
+        let initial_aggr = if groups.has_grouping_set()
+            && groups.groups().len() > 1
+            && !groups.is_empty()
+            && session_state
+                .config()
+                .options()
+                .execution
+                .enable_migration_aggregate
+            && !aggregates.is_empty()
+            && aggregates.iter().all(|agg| agg.order_bys().is_empty())
+        {
+            // Aggregate each input row once, by all the grouping expressions,
+            // then expand the (usually far fewer) groups into each grouping
+            // set by merging their states. Evaluating every grouping set
+            // directly would hash each input row once per set.
+            //
+            // Aggregates with an ORDER BY keep the direct plan, since merging
+            // can break ties differently. Without aggregates, the direct plan
+            // keeps its `LIMIT` pushdown.
+            let finest_aggr = Arc::new(AggregateExec::try_new(
+                AggregateMode::Partial,
+                PhysicalGroupBy::new_single(groups.expr().to_vec()),
+                aggregates,
+                filters.clone(),
+                input_exec,
+                Arc::clone(&physical_input_schema),
+            )?);
+            let expand_groups = PhysicalGroupBy::new(
+                groups
+                    .expr()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (_, name))| {
+                        (
+                            Arc::new(PhysicalColumn::new(name, index)) as _,
+                            name.clone(),
+                        )
+                    })
+                    .collect(),
+                groups.null_expr().to_vec(),
+                groups.groups().to_vec(),
+                true,
+            );
+            Arc::new(AggregateExec::try_new(
+                AggregateMode::PartialReduce,
+                expand_groups,
+                finest_aggr.aggr_expr().to_vec(),
+                filters.clone(),
+                Arc::clone(&finest_aggr) as _,
+                Arc::clone(&physical_input_schema),
+            )?)
+        } else {
+            Arc::new(AggregateExec::try_new(
+                AggregateMode::Partial,
+                groups.clone(),
+                aggregates,
+                filters.clone(),
+                input_exec,
+                Arc::clone(&physical_input_schema),
+            )?)
+        };
 
         let can_repartition = !groups.is_empty()
             && session_state.config().target_partitions() > 1

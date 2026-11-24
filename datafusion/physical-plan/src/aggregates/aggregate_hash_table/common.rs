@@ -28,8 +28,8 @@ use crate::aggregates::group_values::{
 };
 use crate::aggregates::order::GroupClustering;
 use crate::aggregates::{
-    AggregateExec, PhysicalGroupBy, aggregate_expressions, evaluate_group_by,
-    group_id_array, max_duplicate_ordinal,
+    AggregateExec, AggregateMode, PhysicalGroupBy, aggregate_expressions,
+    evaluate_group_by, group_id_array, max_duplicate_ordinal,
 };
 
 use super::AggregateTableMetrics;
@@ -143,11 +143,15 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
 
         let input_schema = agg.input().schema();
         let metrics = AggregateTableMetrics::new(agg, partition);
-        let aggregate_arguments = aggregate_expressions(
-            agg.aggr_expr(),
-            &agg.mode,
-            agg.group_by().num_group_exprs(),
-        )?;
+        // A `PartialReduce` input has one column per group expression. When it
+        // expands grouping sets, its own `__grouping_id` is not in its input.
+        let state_column_base = if agg.mode == AggregateMode::PartialReduce {
+            agg.group_by().expr().len()
+        } else {
+            agg.group_by().num_group_exprs()
+        };
+        let aggregate_arguments =
+            aggregate_expressions(agg.aggr_expr(), &agg.mode, state_column_base)?;
         let accumulators: Vec<_> = agg
             .aggr_expr()
             .iter()
@@ -430,12 +434,16 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
     /// Accumulators receive zero argument rows and zero group IDs, together with the
     /// full registered group count, so they produce the same state as empty input.
     ///
-    /// Only the raw-input tables (partial and single aggregation) call this
-    /// method: grouping sets are expanded while consuming raw rows, so the
-    /// state-input stages (final and partial-reduce aggregation) receive the
-    /// already expanded keys as plain group columns (see
-    /// [`PhysicalGroupBy::as_final`]) and never own a grouping set.
-    pub(super) fn init_empty_grouping_sets(&mut self) -> Result<()> {
+    /// The raw-input tables (partial and single aggregation) call this with
+    /// `update_batch`. A partial-reduce table that expands grouping sets calls
+    /// it with `merge_batch`. Final aggregation receives the already expanded
+    /// keys as plain group columns (see [`PhysicalGroupBy::as_final`]) and
+    /// never owns a grouping set.
+    pub(super) fn init_empty_grouping_sets(
+        &mut self,
+        aggregate_fn: AggregateBatchFn,
+        accumulator_phase: AccumulatorPhase,
+    ) -> Result<()> {
         let group_by_metrics = self.group_by_metrics.clone();
         let state = self.state.building_mut();
         if !state.group_by.has_grouping_set() || !state.group_values.is_empty() {
@@ -493,8 +501,8 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
                 for (idx, (acc, values)) in
                     state.accumulators.iter_mut().zip(values.iter()).enumerate()
                 {
-                    accumulator_metrics.time(idx, AccumulatorPhase::Update, || {
-                        acc.update_batch(values, &[], total_groups)
+                    accumulator_metrics.time(idx, accumulator_phase, || {
+                        aggregate_fn(acc, values, &[], total_groups)
                     })?;
                 }
                 Ok::<(), datafusion_common::DataFusionError>(())
