@@ -80,20 +80,111 @@ macro_rules! hash_float {
 
 hash_float!(f16, f32, f64);
 
+/// What [`GroupValuesPrimitive`] stores in its hash table for each group.
+///
+/// Keys of up to 64 bits are stored in the table next to their group index.
+/// A probe then compares keys without reading `values`, and growing the table
+/// rehashes the key instead of reading it from `values`. Both reads would be
+/// random accesses into `values`, which miss the cache once there are many
+/// groups. Wider keys store their hash instead, so the table entries stay
+/// small.
+pub(crate) trait GroupMapEntry: HashValue + ArrowNativeTypeOp {
+    type Entry: Send;
+
+    fn new_entry(key: Self, group: usize, hash: u64) -> Self::Entry;
+
+    fn group(entry: &Self::Entry) -> usize;
+
+    fn group_mut(entry: &mut Self::Entry) -> &mut usize;
+
+    /// Whether `entry` is the group of `key`, whose hash is `hash`.
+    fn matches(entry: &Self::Entry, key: Self, hash: u64, values: &[Self]) -> bool;
+
+    fn entry_hash(entry: &Self::Entry, state: &RandomState) -> u64;
+}
+
+macro_rules! group_map_entry_with_key {
+    ($($t:ty),+) => {
+        $(impl GroupMapEntry for $t {
+            type Entry = ($t, usize);
+
+            #[inline]
+            fn new_entry(key: Self, group: usize, _hash: u64) -> Self::Entry {
+                (key, group)
+            }
+
+            #[inline]
+            fn group(entry: &Self::Entry) -> usize {
+                entry.1
+            }
+
+            #[inline]
+            fn group_mut(entry: &mut Self::Entry) -> &mut usize {
+                &mut entry.1
+            }
+
+            #[inline]
+            fn matches(entry: &Self::Entry, key: Self, _hash: u64, _values: &[Self]) -> bool {
+                entry.0.is_eq(key)
+            }
+
+            #[inline]
+            fn entry_hash(entry: &Self::Entry, state: &RandomState) -> u64 {
+                entry.0.hash(state)
+            }
+        })+
+    };
+}
+group_map_entry_with_key!(i8, i16, i32, i64, u8, u16, u32, u64);
+group_map_entry_with_key!(f16, f32, f64, IntervalDayTime);
+
+macro_rules! group_map_entry_with_hash {
+    ($($t:ty),+) => {
+        $(impl GroupMapEntry for $t {
+            type Entry = (usize, u64);
+
+            #[inline]
+            fn new_entry(_key: Self, group: usize, hash: u64) -> Self::Entry {
+                (group, hash)
+            }
+
+            #[inline]
+            fn group(entry: &Self::Entry) -> usize {
+                entry.0
+            }
+
+            #[inline]
+            fn group_mut(entry: &mut Self::Entry) -> &mut usize {
+                &mut entry.0
+            }
+
+            #[inline]
+            fn matches(entry: &Self::Entry, key: Self, hash: u64, values: &[Self]) -> bool {
+                // SAFETY: every group index in the table is an index into `values`.
+                hash == entry.1 && unsafe { values.get_unchecked(entry.0) }.is_eq(key)
+            }
+
+            #[inline]
+            fn entry_hash(entry: &Self::Entry, _state: &RandomState) -> u64 {
+                entry.1
+            }
+        })+
+    };
+}
+group_map_entry_with_hash!(i128, i256, IntervalMonthDayNano);
+
 /// A [`GroupValues`] storing a single column of primitive values
 ///
 /// This specialization is significantly faster than using the more general
 /// purpose `Row`s format
-pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
+pub struct GroupValuesPrimitive<T: ArrowPrimitiveType>
+where
+    T::Native: GroupMapEntry,
+{
     /// The data type of the output array
     data_type: DataType,
-    /// Stores the `(group_index, hash)` based on the hash of its value
-    ///
-    /// We also store `hash` is for reducing cost of rehashing. Such cost
-    /// is obvious in high cardinality group by situation.
-    /// More details can see:
-    /// <https://github.com/apache/datafusion/issues/15961>
-    map: HashTable<(usize, u64)>,
+    /// One entry per group, see [`GroupMapEntry`]
+    map: HashTable<<T::Native as GroupMapEntry>::Entry>,
     /// The group index of the null value if any
     null_group: Option<usize>,
     /// The values for each group index
@@ -102,7 +193,10 @@ pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
     random_state: RandomState,
 }
 
-impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
+impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T>
+where
+    T::Native: GroupMapEntry,
+{
     pub fn new(data_type: DataType) -> Self {
         assert!(PrimitiveArray::<T>::is_compatible(&data_type));
         Self {
@@ -117,7 +211,7 @@ impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
 
 impl<T: ArrowPrimitiveType> GroupValues for GroupValuesPrimitive<T>
 where
-    T::Native: HashValue,
+    T::Native: GroupMapEntry,
 {
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
         assert_eq!(cols.len(), 1);
@@ -137,19 +231,20 @@ where
                     let key = key.normalize_key();
                     let state = &self.random_state;
                     let hash = key.hash(state);
+                    let values = &self.values;
                     let insert = self.map.entry(
                         hash,
-                        |&(g, h)| unsafe {
-                            hash == h && self.values.get_unchecked(g).is_eq(key)
-                        },
-                        |&(_, h)| h,
+                        |entry| T::Native::matches(entry, key, hash, values),
+                        |entry| T::Native::entry_hash(entry, state),
                     );
 
                     match insert {
-                        hashbrown::hash_table::Entry::Occupied(o) => o.get().0,
+                        hashbrown::hash_table::Entry::Occupied(o) => {
+                            T::Native::group(o.get())
+                        }
                         hashbrown::hash_table::Entry::Vacant(v) => {
                             let g = self.values.len();
-                            v.insert((g, hash));
+                            v.insert(T::Native::new_entry(key, g, hash));
                             self.values.push(key);
                             g
                         }
@@ -197,11 +292,11 @@ where
             EmitTo::First(n) => {
                 self.map.retain(|entry| {
                     // Decrement group index by n
-                    let group_idx = entry.0;
+                    let group_idx = T::Native::group(entry);
                     match group_idx.checked_sub(n) {
                         // Group index was >= n, shift value down
                         Some(sub) => {
-                            entry.0 = sub;
+                            *T::Native::group_mut(entry) = sub;
                             true
                         }
                         // Group index was < n, so remove from table
@@ -253,7 +348,9 @@ where
     }
 
     fn shrink_to_fit(&mut self) {
-        self.map.shrink_to_fit(|&(_, hash)| hash);
+        let state = &self.random_state;
+        self.map
+            .shrink_to_fit(|entry| T::Native::entry_hash(entry, state));
         self.values.shrink_to_fit();
     }
 
