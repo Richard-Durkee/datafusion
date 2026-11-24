@@ -245,8 +245,12 @@ pub fn get_true_start_end(
     let start = start.clamp(0, input.len() as i64) as usize;
     let end = end.clamp(0, input.len() as i64) as usize;
 
-    // If input is ASCII-only, byte-based indices equal char-based indices
-    if is_input_ascii_only {
+    // If input is ASCII-only, byte-based indices equal char-based indices.
+    // The same holds for any input up to where its first non-ASCII byte is,
+    // so checking the bytes up to the end of the substring is enough. Without
+    // a count, only the start has to be found.
+    let prefix_len = if count.is_some() { end } else { start };
+    if is_input_ascii_only || input.as_bytes()[..prefix_len].is_ascii() {
         return Ok((start, end));
     }
 
@@ -800,6 +804,32 @@ mod tests {
             StringArray
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_true_start_end_non_ascii_after_or_before_the_substring() -> Result<()> {
+        // Character and byte indices agree up to the first non-ASCII byte.
+        let cases = [
+            ("abcdé", 1, Some(3), "abc"),
+            ("abcdé", 2, Some(4), "bcdé"),
+            ("abcdé", 5, Some(1), "é"),
+            ("abcdé", 3, None, "cdé"),
+            ("éabcd", 1, Some(3), "éab"),
+            ("éabcd", 2, Some(2), "ab"),
+            ("éabcd", 2, None, "abcd"),
+            ("ab🌏cd", 4, Some(10), "cd"),
+            ("ab🌏cd", 6, Some(1), ""),
+        ];
+        for (input, start, count, expected) in cases {
+            let (byte_start, byte_end) =
+                super::get_true_start_end(input, start, count, false)?;
+            assert_eq!(
+                &input[byte_start..byte_end],
+                expected,
+                "substr({input:?}, {start}, {count:?})"
+            );
+        }
         Ok(())
     }
 

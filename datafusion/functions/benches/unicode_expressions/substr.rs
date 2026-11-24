@@ -91,6 +91,13 @@ fn criterion_benchmark(c: &mut Criterion) {
             IntArg::Scalar(1),
             Some(IntArg::Scalar(5)),
         ),
+        // A 30-char prefix of a longer input, as in `substr(i_item_desc, 1, 30)`.
+        (
+            "prefix_30_long_input",
+            50..=200,
+            IntArg::Scalar(1),
+            Some(IntArg::Scalar(30)),
+        ),
         // No count, so each result runs to the end of the input.
         ("no_count", 1..=64, IntArg::Scalar(5), None),
         // `start` computed per row, as in `substr(s, strpos(s, ':') + 1, 8)`.
