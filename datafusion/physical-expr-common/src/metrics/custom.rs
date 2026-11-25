@@ -24,6 +24,9 @@ use std::{any::Any, fmt::Debug, fmt::Display, sync::Arc};
 ///    PartialEq trait because this trait is used dynamically in the context of
 ///    [`MetricValue::Custom`]
 ///
+/// Optionally, [`Self::aggregation`] describes how [`Self::aggregate`]
+/// combines the numeric values, for code that only has those.
+///
 /// # Examples
 /// ```
 /// # use std::sync::Arc;
@@ -98,4 +101,64 @@ pub trait CustomMetricValue: Display + Debug + Send + Sync {
 
     /// Compares this value with another custom value.
     fn is_eq(&self, other: &Arc<dyn CustomMetricValue>) -> bool;
+
+    /// Describes what [`Self::aggregate`] does to [`Self::as_usize`].
+    ///
+    /// Code that has only the numeric value of each partition, and not the
+    /// values themselves, uses this to combine them. For example, a
+    /// distributed engine that sends metrics from workers to a coordinator
+    /// can't call [`Self::aggregate`] there, since the coordinator doesn't
+    /// have this type. The default, [`CustomMetricAggregation::Unknown`],
+    /// tells it not to make up a total.
+    fn aggregation(&self) -> CustomMetricAggregation {
+        CustomMetricAggregation::Unknown
+    }
+}
+
+/// What [`CustomMetricValue::aggregate`] does to
+/// [`CustomMetricValue::as_usize`], as returned by
+/// [`CustomMetricValue::aggregation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum CustomMetricAggregation {
+    /// Not described, or not a function of `as_usize` alone. Don't combine
+    /// the numeric values.
+    #[default]
+    Unknown,
+    /// The aggregate's `as_usize` is the sum of the values' `as_usize`.
+    Sum,
+    /// The aggregate's `as_usize` is the largest of the values' `as_usize`.
+    Max,
+    /// The aggregate's `as_usize` is the smallest of the values' `as_usize`.
+    Min,
+}
+
+impl CustomMetricAggregation {
+    /// Combines the numeric values of several partitions as
+    /// [`CustomMetricValue::aggregate`] would, or returns `None` when that
+    /// isn't known.
+    pub fn combine(self, values: impl IntoIterator<Item = usize>) -> Option<usize> {
+        let values = values.into_iter();
+        match self {
+            Self::Unknown => None,
+            Self::Sum => Some(values.fold(0, usize::saturating_add)),
+            Self::Max => values.max(),
+            Self::Min => values.min(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CustomMetricAggregation;
+
+    #[test]
+    fn combine_follows_the_aggregation() {
+        let values = [12, 30, 5];
+        assert_eq!(CustomMetricAggregation::Sum.combine(values), Some(47));
+        assert_eq!(CustomMetricAggregation::Max.combine(values), Some(30));
+        assert_eq!(CustomMetricAggregation::Min.combine(values), Some(5));
+        assert_eq!(CustomMetricAggregation::Unknown.combine(values), None);
+        assert_eq!(CustomMetricAggregation::Max.combine([]), None);
+    }
 }
