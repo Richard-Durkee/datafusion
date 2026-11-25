@@ -1,0 +1,172 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+# A COPY or INSERT whose input query fails must not commit the rows written
+# before the error, and must not replace an existing target file.
+
+# Small batches, so many batches reach the writer before the failing row.
+statement ok
+set datafusion.execution.batch_size = 2;
+
+statement ok
+CREATE VIEW failing AS
+SELECT value AS a, 10 / (value - 1000) AS b FROM generate_series(1, 2000);
+
+statement ok
+CREATE VIEW good AS SELECT value AS a, value AS b FROM generate_series(1, 3);
+
+# COPY over an existing Parquet file
+statement ok
+COPY (SELECT * FROM good) TO 'test_files/scratch/copy_failure/existing.parquet';
+
+statement error Divide by zero
+COPY (SELECT * FROM failing) TO 'test_files/scratch/copy_failure/existing.parquet';
+
+statement ok
+CREATE EXTERNAL TABLE existing_parquet STORED AS PARQUET
+LOCATION 'test_files/scratch/copy_failure/existing.parquet';
+
+query I
+SELECT count(*) FROM existing_parquet;
+----
+3
+
+# COPY over an existing CSV file
+statement ok
+COPY (SELECT * FROM good) TO 'test_files/scratch/copy_failure/existing.csv'
+STORED AS CSV OPTIONS ('format.has_header' 'true');
+
+statement error Divide by zero
+COPY (SELECT * FROM failing) TO 'test_files/scratch/copy_failure/existing.csv'
+STORED AS CSV OPTIONS ('format.has_header' 'true');
+
+statement ok
+CREATE EXTERNAL TABLE existing_csv STORED AS CSV
+LOCATION 'test_files/scratch/copy_failure/existing.csv'
+OPTIONS ('format.has_header' 'true');
+
+query I
+SELECT count(*) FROM existing_csv;
+----
+3
+
+# COPY to a new path leaves no file behind
+statement error Divide by zero
+COPY (SELECT * FROM failing) TO 'test_files/scratch/copy_failure/new.parquet';
+
+statement error No files found
+CREATE EXTERNAL TABLE new_parquet STORED AS PARQUET
+LOCATION 'test_files/scratch/copy_failure/new.parquet';
+
+# INSERT INTO a listing table keeps only the rows of successful statements
+statement ok
+CREATE EXTERNAL TABLE t (a BIGINT, b BIGINT) STORED AS PARQUET
+LOCATION 'test_files/scratch/copy_failure/t/';
+
+statement ok
+INSERT INTO t SELECT * FROM good;
+
+statement error Divide by zero
+INSERT INTO t SELECT * FROM failing;
+
+query I
+SELECT count(*) FROM t;
+----
+3
+
+# The same for a partitioned table
+statement ok
+CREATE EXTERNAL TABLE tp (a BIGINT, b BIGINT, p BIGINT) STORED AS PARQUET
+PARTITIONED BY (p) LOCATION 'test_files/scratch/copy_failure/tp/';
+
+statement ok
+INSERT INTO tp SELECT a, b, a % 3 FROM good;
+
+statement error Divide by zero
+INSERT INTO tp SELECT a, b, a % 3 FROM failing;
+
+query I
+SELECT count(*) FROM tp;
+----
+3
+
+# A partitioned COPY that fails leaves no partition behind
+statement error Divide by zero
+COPY (SELECT a, b, a % 3 AS p FROM failing) TO 'test_files/scratch/copy_failure/part/'
+STORED AS PARQUET PARTITIONED BY (p);
+
+statement error No files found
+CREATE EXTERNAL TABLE part_parquet STORED AS PARQUET
+LOCATION 'test_files/scratch/copy_failure/part/';
+
+# The sequential Parquet writer (the parallel one is the default)
+statement ok
+set datafusion.execution.parquet.allow_single_file_parallelism = false;
+
+statement ok
+COPY (SELECT * FROM good) TO 'test_files/scratch/copy_failure/sequential.parquet';
+
+statement error Divide by zero
+COPY (SELECT * FROM failing) TO 'test_files/scratch/copy_failure/sequential.parquet';
+
+statement ok
+reset datafusion.execution.parquet.allow_single_file_parallelism;
+
+statement ok
+CREATE EXTERNAL TABLE sequential_parquet STORED AS PARQUET
+LOCATION 'test_files/scratch/copy_failure/sequential.parquet';
+
+query I
+SELECT count(*) FROM sequential_parquet;
+----
+3
+
+# COPY over an existing JSON file
+statement ok
+COPY (SELECT * FROM good) TO 'test_files/scratch/copy_failure/existing.json' STORED AS JSON;
+
+statement error Divide by zero
+COPY (SELECT * FROM failing) TO 'test_files/scratch/copy_failure/existing.json' STORED AS JSON;
+
+statement ok
+CREATE EXTERNAL TABLE existing_json STORED AS JSON
+LOCATION 'test_files/scratch/copy_failure/existing.json';
+
+query I
+SELECT count(*) FROM existing_json;
+----
+3
+
+# COPY over an existing Arrow IPC file
+statement ok
+COPY (SELECT * FROM good) TO 'test_files/scratch/copy_failure/existing.arrow' STORED AS ARROW;
+
+statement error Divide by zero
+COPY (SELECT * FROM failing) TO 'test_files/scratch/copy_failure/existing.arrow' STORED AS ARROW;
+
+statement ok
+CREATE EXTERNAL TABLE existing_arrow STORED AS ARROW
+LOCATION 'test_files/scratch/copy_failure/existing.arrow';
+
+query I
+SELECT count(*) FROM existing_arrow;
+----
+3
+
+# A COPY that rotates across many files before failing leaves none of them
+statement ok
+set datafusion.execution.soft_max_rows_per_output_file = 100;
+
+statement error Divide by zero
+COPY (SELECT * FROM failing) TO 'test_files/scratch/copy_failure/rotated/' STORED AS PARQUET;
+
+statement ok
+reset datafusion.execution.soft_max_rows_per_output_file;
+
+statement error No files found
+CREATE EXTERNAL TABLE rotated STORED AS PARQUET
+LOCATION 'test_files/scratch/copy_failure/rotated/';
+
+statement ok
+reset datafusion.execution.batch_size;

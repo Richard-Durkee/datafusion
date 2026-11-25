@@ -11,6 +11,7 @@ use std::fmt::{self, Debug};
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 
+use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::ipc::convert::try_fb_to_schema;
@@ -21,16 +22,15 @@ use datafusion_common::config::{ArrowOptions, ConfigField, ConfigFileType};
 use datafusion_common::error::Result;
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::{
-    DEFAULT_ARROW_EXTENSION, DataFusionError, GetExt, Statistics,
-    internal_datafusion_err, not_impl_err,
+    DEFAULT_ARROW_EXTENSION, GetExt, Statistics, internal_datafusion_err, not_impl_err,
 };
-use datafusion_common_runtime::{JoinSet, SpawnedTask};
+use datafusion_common_runtime::SpawnedTask;
 use datafusion_datasource::display::FileGroupDisplay;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use datafusion_datasource::write::{
-    ObjectWriterBuilder, SharedBuffer, get_writer_schema,
+    ObjectWriterBuilder, SharedBuffer, get_writer_schema, write_files_then_commit,
 };
 use datafusion_datasource::{TableSchema, TableSchemaBuilder};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -44,7 +44,7 @@ use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_format::{FileFormat, FileFormatFactory};
 use datafusion_datasource::file_sink_config::{FileSink, FileSinkConfig};
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_datasource::write::demux::DemuxedStreamReceiver;
+use datafusion_datasource::write::demux::{DemuxedStreamReceiver, FileMetadata};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion_session::Session;
 use futures::StreamExt;
@@ -54,6 +54,7 @@ use object_store::{
     path::Path,
 };
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc::Receiver;
 
 /// Initial writing buffer size. Note this is just a size hint for efficiency. It
 /// will grow beyond the set value if needed.
@@ -295,12 +296,9 @@ impl FileSink for ArrowFileSink {
         &self,
         context: &Arc<TaskContext>,
         demux_task: SpawnedTask<Result<()>>,
-        mut file_stream_rx: DemuxedStreamReceiver,
+        file_stream_rx: DemuxedStreamReceiver,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<u64> {
-        let mut file_write_tasks: JoinSet<std::result::Result<usize, DataFusionError>> =
-            JoinSet::new();
-
         let ipc_options = IpcWriteOptions::try_new(
             self.options.alignment,
             false,
@@ -308,7 +306,7 @@ impl FileSink for ArrowFileSink {
         )?
         .try_with_compression(self.options.compression.into())?
         .try_with_compression_level(self.options.compression_level)?;
-        while let Some((file_metadata, mut rx)) = file_stream_rx.recv().await {
+        let start_file = |file_metadata: FileMetadata, mut rx: Receiver<RecordBatch>| {
             let shared_buffer = SharedBuffer::new(INITIAL_BUFFER_BYTES);
             let mut arrow_writer = arrow_ipc::writer::FileWriter::try_new_with_options(
                 shared_buffer.clone(),
@@ -329,7 +327,7 @@ impl FileSink for ArrowFileSink {
             ))
             .with_bytes_written_counter(file_metadata.size)
             .build()?;
-            file_write_tasks.spawn(async move {
+            Ok(async move {
                 let mut row_count = 0;
                 while let Some(batch) = rx.recv().await {
                     row_count += batch.num_rows();
@@ -344,34 +342,18 @@ impl FileSink for ArrowFileSink {
                 }
                 arrow_writer.finish()?;
                 let final_buff = shared_buffer.buffer.try_lock().unwrap();
-
                 object_store_writer.write_all(final_buff.as_slice()).await?;
-                object_store_writer.shutdown().await?;
-                Ok(row_count)
-            });
-        }
-
-        let mut row_count = 0;
-        while let Some(result) = file_write_tasks.join_next().await {
-            match result {
-                Ok(r) => {
-                    row_count += r?;
-                }
-                Err(e) => {
-                    if e.is_panic() {
-                        std::panic::resume_unwind(e.into_panic());
-                    } else {
-                        unreachable!();
-                    }
-                }
-            }
-        }
-
-        demux_task
-            .join_unwind()
-            .await
-            .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
-        Ok(row_count as u64)
+                drop(final_buff);
+                // Not shut down here: the file is committed once the whole write succeeds.
+                Ok((object_store_writer, row_count))
+            })
+        };
+        let row_counts =
+            write_files_then_commit(demux_task, file_stream_rx, |file, rx| {
+                std::future::ready(start_file(file, rx))
+            })
+            .await?;
+        Ok(row_counts.into_iter().sum::<usize>() as u64)
     }
 }
 
