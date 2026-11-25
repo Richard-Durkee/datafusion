@@ -4,6 +4,8 @@
 
 //! Custom metric value type.
 
+#[cfg(feature = "proto")]
+use datafusion_common::Result;
 use std::{any::Any, fmt::Debug, fmt::Display, sync::Arc};
 
 /// A trait for implementing custom metric values.
@@ -98,4 +100,21 @@ pub trait CustomMetricValue: Display + Debug + Send + Sync {
 
     /// Compares this value with another custom value.
     fn is_eq(&self, other: &Arc<dyn CustomMetricValue>) -> bool;
+
+    /// Encodes this value so it can be sent to another process and rebuilt
+    /// there as the same type, or returns `None` if it can't be. The default
+    /// returns `None`.
+    ///
+    /// Distributed engines send the metrics of each task from the worker that
+    /// ran it to a coordinator, which aggregates them. Rebuilding the value as
+    /// its own type there keeps [`Self::aggregate`] and `Display` working.
+    /// Implement it together with
+    /// [`ExtensionMetricFromProto`](super::ExtensionMetricFromProto), and
+    /// build the result with
+    /// [`encoded_metric`](super::encoded_metric), which stamps the name the
+    /// value is registered under.
+    #[cfg(feature = "proto")]
+    fn try_to_proto(&self) -> Result<Option<super::EncodedCustomMetric>> {
+        Ok(None)
+    }
 }

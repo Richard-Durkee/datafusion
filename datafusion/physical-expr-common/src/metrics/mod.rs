@@ -7,6 +7,8 @@
 mod baseline;
 mod builder;
 mod custom;
+#[cfg(feature = "proto")]
+mod custom_proto;
 mod elapsed_compute;
 mod expression;
 mod snapshot;
@@ -30,6 +32,11 @@ use std::{
 pub use baseline::{BaselineMetrics, RecordOutput, SpillMetrics, SplitMetrics};
 pub use builder::MetricBuilder;
 pub use custom::CustomMetricValue;
+#[cfg(feature = "proto")]
+pub use custom_proto::{
+    EncodedCustomMetric, ExtensionMetricFromProto, custom_metric_names,
+    decode_custom_metric, encoded_metric,
+};
 pub use elapsed_compute::{ElapsedComputeFuture, ElapsedComputeFutureExt};
 pub use expression::ExpressionEvaluatorMetrics;
 pub use value::{
