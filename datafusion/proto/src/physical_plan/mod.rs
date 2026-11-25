@@ -50,6 +50,7 @@ use datafusion_physical_plan::joins::{
 };
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::memory::LazyMemoryExec;
+use datafusion_physical_plan::metrics::CustomMetricValue;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::proto::{
@@ -1614,6 +1615,34 @@ pub trait PhysicalExtensionCodec: Debug + Send + Sync + Any {
     fn try_encode_udwf(&self, _node: &WindowUDF, _buf: &mut Vec<u8>) -> Result<()> {
         Ok(())
     }
+
+    /// Encodes the value of a [`MetricValue::Custom`] named `name` into `buf`.
+    ///
+    /// Returns `false` when this codec doesn't know the value's type, which is
+    /// the default. Distributed engines use this to send the metrics of an
+    /// extension operator from the workers that ran it to the coordinator,
+    /// where the value is rebuilt with [`Self::try_decode_metric`] so its own
+    /// `aggregate` and `Display` still apply. A codec that knows several
+    /// metric types writes which one it encoded into `buf`.
+    ///
+    /// [`MetricValue::Custom`]: datafusion_physical_plan::metrics::MetricValue::Custom
+    fn try_encode_metric(
+        &self,
+        _name: &str,
+        _value: &dyn CustomMetricValue,
+        _buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Rebuilds a custom metric value that [`Self::try_encode_metric`] encoded.
+    fn try_decode_metric(
+        &self,
+        name: &str,
+        _buf: &[u8],
+    ) -> Result<Arc<dyn CustomMetricValue>> {
+        not_impl_err!("PhysicalExtensionCodec is not provided for custom metric {name}")
+    }
 }
 
 #[derive(Debug)]
@@ -1991,6 +2020,37 @@ impl PhysicalExtensionCodec for ComposedPhysicalExtensionCodec {
     fn try_encode_udaf(&self, node: &AggregateUDF, buf: &mut Vec<u8>) -> Result<()> {
         self.encode_protobuf(buf, |codec, data| codec.try_encode_udaf(node, data))
     }
+
+    fn try_encode_metric(
+        &self,
+        name: &str,
+        value: &dyn CustomMetricValue,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        // Unlike plans, a metric's type is known to at most one codec, so try
+        // each until one encodes it.
+        for (position, codec) in self.codecs.iter().enumerate() {
+            let mut data = vec![];
+            if codec.try_encode_metric(name, value, &mut data)? {
+                DataEncoderTuple {
+                    encoder_position: position as u32,
+                    blob: data,
+                }
+                .encode(buf)
+                .map_err(|e| internal_datafusion_err!("{e}"))?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn try_decode_metric(
+        &self,
+        name: &str,
+        buf: &[u8],
+    ) -> Result<Arc<dyn CustomMetricValue>> {
+        self.decode_protobuf(buf, |codec, data| codec.try_decode_metric(name, data))
+    }
 }
 
 /// Add "nothing is registered under this name" context to the error a
@@ -2147,5 +2207,169 @@ impl ExecutionPlanDecode for ConverterPlanDecoder<'_, '_> {
                 .udwf(name)
                 .or_else(|_| self.ctx.codec().try_decode_udwf(name, &[])),
         }
+    }
+}
+
+#[cfg(test)]
+mod custom_metric_codec_tests {
+    use super::*;
+    use std::any::Any;
+    use std::fmt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A metric that keeps the largest value, which a coordinator could not
+    /// aggregate from `as_usize` alone without knowing that.
+    #[derive(Debug, Default)]
+    struct MaxMillis(AtomicUsize);
+
+    impl fmt::Display for MaxMillis {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "max {} ms", self.0.load(Ordering::Relaxed))
+        }
+    }
+
+    impl CustomMetricValue for MaxMillis {
+        fn new_empty(&self) -> Arc<dyn CustomMetricValue> {
+            Arc::new(Self::default())
+        }
+
+        fn aggregate(&self, other: Arc<dyn CustomMetricValue>) {
+            self.0.fetch_max(other.as_usize(), Ordering::Relaxed);
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_usize(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+
+        fn is_eq(&self, other: &Arc<dyn CustomMetricValue>) -> bool {
+            other.as_usize() == self.as_usize()
+        }
+    }
+
+    /// Knows only `MaxMillis`, like the codec of a crate that ships an
+    /// extension operator.
+    #[derive(Debug)]
+    struct MaxMillisCodec;
+
+    impl PhysicalExtensionCodec for MaxMillisCodec {
+        fn try_decode(
+            &self,
+            _buf: &[u8],
+            _inputs: &[Arc<dyn ExecutionPlan>],
+            _ctx: &TaskContext,
+            _proto_converter: &dyn PhysicalProtoConverterExtension,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            not_impl_err!("plans")
+        }
+
+        fn try_encode(
+            &self,
+            _node: Arc<dyn ExecutionPlan>,
+            _buf: &mut Vec<u8>,
+            _proto_converter: &dyn PhysicalProtoConverterExtension,
+        ) -> Result<()> {
+            not_impl_err!("plans")
+        }
+
+        fn try_encode_metric(
+            &self,
+            _name: &str,
+            value: &dyn CustomMetricValue,
+            buf: &mut Vec<u8>,
+        ) -> Result<bool> {
+            let Some(max) = value.as_any().downcast_ref::<MaxMillis>() else {
+                return Ok(false);
+            };
+            buf.extend((max.as_usize() as u64).to_le_bytes());
+            Ok(true)
+        }
+
+        fn try_decode_metric(
+            &self,
+            _name: &str,
+            buf: &[u8],
+        ) -> Result<Arc<dyn CustomMetricValue>> {
+            let bytes: [u8; 8] = buf
+                .try_into()
+                .map_err(|_| internal_datafusion_err!("bad MaxMillis"))?;
+            Ok(Arc::new(MaxMillis(AtomicUsize::new(
+                u64::from_le_bytes(bytes) as usize,
+            ))))
+        }
+    }
+
+    fn max_millis(value: usize) -> Arc<dyn CustomMetricValue> {
+        Arc::new(MaxMillis(AtomicUsize::new(value)))
+    }
+
+    #[test]
+    fn composed_codec_finds_the_codec_that_knows_the_metric() -> Result<()> {
+        let codec = ComposedPhysicalExtensionCodec::new(vec![
+            Arc::new(DefaultPhysicalExtensionCodec {}),
+            Arc::new(MaxMillisCodec),
+        ]);
+
+        // Each worker encodes its own value, and the coordinator decodes them.
+        let mut decoded = vec![];
+        for value in [30, 12] {
+            let mut buf = vec![];
+            assert!(codec.try_encode_metric(
+                "wait",
+                max_millis(value).as_ref(),
+                &mut buf
+            )?);
+            decoded.push(codec.try_decode_metric("wait", &buf)?);
+        }
+
+        // The coordinator now aggregates with the metric's own type.
+        let total = decoded[0].new_empty();
+        for value in decoded {
+            assert!(value.as_any().downcast_ref::<MaxMillis>().is_some());
+            total.aggregate(value);
+        }
+        assert_eq!(total.to_string(), "max 30 ms");
+        Ok(())
+    }
+
+    #[test]
+    fn codecs_skip_metrics_they_do_not_know() -> Result<()> {
+        #[derive(Debug, Default)]
+        struct Other;
+
+        impl fmt::Display for Other {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("other")
+            }
+        }
+
+        impl CustomMetricValue for Other {
+            fn new_empty(&self) -> Arc<dyn CustomMetricValue> {
+                Arc::new(Self)
+            }
+            fn aggregate(&self, _other: Arc<dyn CustomMetricValue>) {}
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn is_eq(&self, _other: &Arc<dyn CustomMetricValue>) -> bool {
+                true
+            }
+        }
+
+        let codec = ComposedPhysicalExtensionCodec::new(vec![
+            Arc::new(DefaultPhysicalExtensionCodec {}),
+            Arc::new(MaxMillisCodec),
+        ]);
+        let mut buf = vec![];
+        assert!(!codec.try_encode_metric("other", &Other, &mut buf)?);
+        assert!(buf.is_empty());
+
+        let default = DefaultPhysicalExtensionCodec {};
+        assert!(!default.try_encode_metric("wait", max_millis(1).as_ref(), &mut buf)?);
+        assert!(default.try_decode_metric("wait", &[]).is_err());
+        Ok(())
     }
 }
