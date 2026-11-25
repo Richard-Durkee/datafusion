@@ -34,8 +34,8 @@ pub use builder::MetricBuilder;
 pub use custom::CustomMetricValue;
 #[cfg(feature = "proto")]
 pub use custom_proto::{
-    EncodedCustomMetric, ExtensionMetricFromProto, custom_metric_names,
-    decode_custom_metric, encoded_metric,
+    CustomMetricDecodeCtx, EncodedCustomMetric, ExtensionMetricFromProto,
+    custom_metric_names, decode_custom_metric, extension_metric,
 };
 pub use elapsed_compute::{ElapsedComputeFuture, ElapsedComputeFutureExt};
 pub use expression::ExpressionEvaluatorMetrics;

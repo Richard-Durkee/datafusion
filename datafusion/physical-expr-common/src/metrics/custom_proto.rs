@@ -26,7 +26,7 @@ pub struct EncodedCustomMetric {
 /// Builds the [`EncodedCustomMetric`] for a value of type `T`, stamping
 /// `T`'s [`NAME`](ExtensionMetricFromProto::NAME) so the encoded name and the
 /// registered one can't drift apart.
-pub fn encoded_metric<T: ExtensionMetricFromProto>(
+pub fn extension_metric<T: ExtensionMetricFromProto>(
     payload: Vec<u8>,
 ) -> EncodedCustomMetric {
     EncodedCustomMetric {
@@ -34,6 +34,14 @@ pub fn encoded_metric<T: ExtensionMetricFromProto>(
         payload,
     }
 }
+
+/// Decode-side context for [`ExtensionMetricFromProto::try_from_proto`].
+///
+/// Empty today. It exists so that the decoder can later be given more, such
+/// as the session, without changing the trait's signature.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct CustomMetricDecodeCtx {}
 
 /// The wire name of a [`CustomMetricValue`] type, and the constructor that
 /// rebuilds it.
@@ -46,16 +54,21 @@ pub fn encoded_metric<T: ExtensionMetricFromProto>(
 ///     // ...
 ///     fn try_to_proto(&self) -> Result<Option<EncodedCustomMetric>> {
 ///         let millis = self.as_usize() as u64;
-///         Ok(Some(encoded_metric::<Self>(millis.to_le_bytes().to_vec())))
+///         Ok(Some(extension_metric::<Self>(millis.to_le_bytes().to_vec())))
 ///     }
 /// }
 ///
 /// impl ExtensionMetricFromProto for MaxMillis {
 ///     const NAME: &'static str = "my-crate.MaxMillis";
 ///
-///     fn try_from_proto(payload: &[u8]) -> Result<Arc<dyn CustomMetricValue>> {
-///         let millis = u64::from_le_bytes(payload.try_into().unwrap());
-///         Ok(Arc::new(MaxMillis::new(millis as usize)))
+///     fn try_from_proto(
+///         payload: &[u8],
+///         _ctx: &CustomMetricDecodeCtx,
+///     ) -> Result<Arc<dyn CustomMetricValue>> {
+///         let bytes: [u8; 8] = payload
+///             .try_into()
+///             .map_err(|_| internal_datafusion_err!("MaxMillis takes 8 bytes"))?;
+///         Ok(Arc::new(MaxMillis::new(u64::from_le_bytes(bytes) as usize)))
 ///     }
 /// }
 ///
@@ -71,7 +84,10 @@ pub trait ExtensionMetricFromProto: CustomMetricValue + Sized + 'static {
 
     /// Rebuilds the value from the payload its
     /// [`CustomMetricValue::try_to_proto`] wrote.
-    fn try_from_proto(payload: &[u8]) -> Result<Arc<dyn CustomMetricValue>>;
+    fn try_from_proto(
+        payload: &[u8],
+        ctx: &CustomMetricDecodeCtx,
+    ) -> Result<Arc<dyn CustomMetricValue>>;
 
     /// Registers this type's decoder in `registry`, under [`Self::NAME`].
     ///
@@ -91,17 +107,23 @@ pub trait ExtensionMetricFromProto: CustomMetricValue + Sized + 'static {
     }
 }
 
-type CustomMetricDecoder = fn(&[u8]) -> Result<Arc<dyn CustomMetricValue>>;
+type CustomMetricDecoder =
+    fn(&[u8], &CustomMetricDecodeCtx) -> Result<Arc<dyn CustomMetricValue>>;
 
 /// Rebuilds an encoded custom metric with the decoder registered for its
 /// type, or returns `None` if no decoder is registered under its name.
+///
+/// Unlike the plan and expression decoders, which `datafusion-proto` calls,
+/// this is public API: DataFusion doesn't serialize metrics itself, so the
+/// engine that sends them calls it. On `None` the engine decides what to
+/// show, for example the value's rendered text.
 pub fn decode_custom_metric(
     registry: &ProtoDecoderRegistry,
     encoded: &EncodedCustomMetric,
 ) -> Option<Result<Arc<dyn CustomMetricValue>>> {
     let decoder = registry
         .decoder::<dyn CustomMetricValue, CustomMetricDecoder>(&encoded.type_name)?;
-    Some(decoder(&encoded.payload))
+    Some(decoder(&encoded.payload, &CustomMetricDecodeCtx::default()))
 }
 
 /// The names of the custom metric types registered in `registry`.
@@ -154,14 +176,19 @@ mod tests {
 
         fn try_to_proto(&self) -> Result<Option<EncodedCustomMetric>> {
             let millis = self.as_usize() as u64;
-            Ok(Some(encoded_metric::<Self>(millis.to_le_bytes().to_vec())))
+            Ok(Some(extension_metric::<Self>(
+                millis.to_le_bytes().to_vec(),
+            )))
         }
     }
 
     impl ExtensionMetricFromProto for MaxMillis {
         const NAME: &'static str = "test.MaxMillis";
 
-        fn try_from_proto(payload: &[u8]) -> Result<Arc<dyn CustomMetricValue>> {
+        fn try_from_proto(
+            payload: &[u8],
+            _ctx: &CustomMetricDecodeCtx,
+        ) -> Result<Arc<dyn CustomMetricValue>> {
             let bytes: [u8; 8] = payload
                 .try_into()
                 .map_err(|_| internal_datafusion_err!("MaxMillis takes 8 bytes"))?;
@@ -200,7 +227,10 @@ mod tests {
     impl ExtensionMetricFromProto for OtherMaxMillis {
         const NAME: &'static str = MaxMillis::NAME;
 
-        fn try_from_proto(_payload: &[u8]) -> Result<Arc<dyn CustomMetricValue>> {
+        fn try_from_proto(
+            _payload: &[u8],
+            _ctx: &CustomMetricDecodeCtx,
+        ) -> Result<Arc<dyn CustomMetricValue>> {
             Ok(Arc::new(Self))
         }
     }
@@ -238,6 +268,22 @@ mod tests {
 
         // Types that don't encode themselves keep the default.
         assert!(OtherMaxMillis.try_to_proto()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_corrupt_payload_is_a_decode_error() -> Result<()> {
+        let mut registry = ProtoDecoderRegistry::new();
+        MaxMillis::register_proto(&mut registry)?;
+        let encoded = EncodedCustomMetric {
+            type_name: MaxMillis::NAME.to_string(),
+            payload: vec![1, 2, 3],
+        };
+
+        let err = decode_custom_metric(&registry, &encoded)
+            .expect("the type is registered")
+            .expect_err("three bytes can't be a MaxMillis");
+        assert!(err.to_string().contains("MaxMillis takes 8 bytes"), "{err}");
         Ok(())
     }
 

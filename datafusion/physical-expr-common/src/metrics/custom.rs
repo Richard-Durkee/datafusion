@@ -111,7 +111,7 @@ pub trait CustomMetricValue: Display + Debug + Send + Sync {
     /// Implement it together with
     /// [`ExtensionMetricFromProto`](super::ExtensionMetricFromProto), and
     /// build the result with
-    /// [`encoded_metric`](super::encoded_metric), which stamps the name the
+    /// [`extension_metric`](super::extension_metric), which stamps the name the
     /// value is registered under.
     #[cfg(feature = "proto")]
     fn try_to_proto(&self) -> Result<Option<super::EncodedCustomMetric>> {
